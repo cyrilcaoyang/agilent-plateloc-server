@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agilent-plateloc"
-version = "1.1.0"
+version = "1.2.1"
 description = "Python driver and REST API for the Agilent PlateLoc Thermal Microplate Sealer (lab status spec v1.1)"
 readme = "README.md"
 authors = [

@@ -111,6 +111,10 @@ _DEFAULTS: dict[str, Any] = {
         # If auto-connect at startup hangs (COM/ActiveX edge cases), give up
         # after this many seconds and leave the service in `requires_init`.
         "startup_connect_timeout_s": 15.0,
+        # Layer-1 temperature interlock (see docs/INTERLOCKS.md). When true,
+        # /control/seal/start refuses with HTTP 412 if the heater is outside
+        # +/- temperature_tolerance_c of the setpoint. Default true.
+        "enforce_temp_interlock": True,
     },
     # Identity reported in /status; should match the entry in the dashboard's
     # `equipment.yaml`. equipment_kind is fixed at "plate_sealer".

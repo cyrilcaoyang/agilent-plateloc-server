@@ -2,8 +2,6 @@
   "allowed_actions": [
     "startup",
     "shutdown",
-    "seal.start",
-    "seal.stop",
     "seal.set_temperature",
     "seal.set_time",
     "stage.in",
@@ -13,8 +11,8 @@
     "heater": {
       "connected": true,
       "last_event_at": null,
-      "message": "At setpoint (170 C)",
-      "state": "stable"
+      "message": "Heating 80 -> 170 C",
+      "state": "heating"
     },
     "sealer": {
       "connected": true,
@@ -31,8 +29,12 @@
   },
   "details": {
     "activex_version": "DRY-RUN-AX",
+    "claimed_by": {
+      "expires_at": "2026-04-29T22:51:01Z",
+      "owner": "fixture",
+      "session_id": "fixture-session"
+    },
     "com_port": "DRY-RUN",
-    "dry_run": true,
     "firmware_version": "DRY-RUN-1.0",
     "temperature_tolerance_c": 2.0
   },
@@ -40,16 +42,16 @@
   "equipment_id": "plateloc",
   "equipment_kind": "plate_sealer",
   "equipment_name": "Agilent PlateLoc",
-  "equipment_status": "dry_run",
+  "equipment_status": "ready",
   "equipment_version": null,
   "host": "plateloc-pc",
   "last_error": null,
-  "message": "Dry-run mode - no hardware connected",
+  "message": "Idle, ready to seal",
   "metrics": {
     "actual_temperature": {
       "timestamp": "2026-04-29T22:50:01Z",
       "unit": "C",
-      "value": 170
+      "value": 80
     },
     "cycle_count": {
       "timestamp": null,
@@ -69,7 +71,7 @@
     "temperature_delta_c": {
       "timestamp": "2026-04-29T22:50:01Z",
       "unit": "C",
-      "value": 0.0
+      "value": -90.0
     }
   },
   "protocol_version": "1.1",

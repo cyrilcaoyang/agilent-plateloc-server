@@ -9,6 +9,12 @@
     "stage.out"
   ],
   "components": {
+    "heater": {
+      "connected": true,
+      "last_event_at": null,
+      "message": "At setpoint (170 C)",
+      "state": "stable"
+    },
     "sealer": {
       "connected": true,
       "last_event_at": null,
@@ -25,7 +31,8 @@
   "details": {
     "activex_version": "DRY-RUN-AX",
     "com_port": "DRY-RUN",
-    "firmware_version": "DRY-RUN-1.0"
+    "firmware_version": "DRY-RUN-1.0",
+    "temperature_tolerance_c": 2.0
   },
   "device_time": "2026-04-29T22:50:01Z",
   "equipment_id": "plateloc",
@@ -56,6 +63,11 @@
       "timestamp": "2026-04-29T22:50:01Z",
       "unit": "C",
       "value": 170
+    },
+    "temperature_delta_c": {
+      "timestamp": "2026-04-29T22:50:01Z",
+      "unit": "C",
+      "value": 0.0
     }
   },
   "protocol_version": "1.1",

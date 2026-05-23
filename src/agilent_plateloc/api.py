@@ -59,7 +59,7 @@ from .models import (
     HealthResponse,
     ProbeResponse,
 )
-from .service import PlateLocService
+from .service import PlateLocService, TemperatureOutOfBand
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +130,7 @@ def create_app(
     *,
     dry_run: bool | None = None,
     enforce_claims: bool | None = None,
+    enforce_temp_interlock: bool | None = None,
 ) -> FastAPI:
     """Build the FastAPI application.
 
@@ -144,14 +145,26 @@ def create_app(
         ``False`` for v1.1 *advisory* deployments where the device
         publishes ``allowed_actions`` and ``details.claimed_by`` but
         does not block writes from clients without a token.
+    enforce_temp_interlock:
+        Layer-1 temperature interlock. ``None`` means "use the config
+        file" (default ``True``). When True, ``/control/seal/start``
+        returns HTTP 412 if ``abs(actual - setpoint) > tolerance``.
     """
 
     if dry_run is None:
         dry_run = bool(_config.get("service", "dry_run", False))
     if enforce_claims is None:
         enforce_claims = bool(_config.get("service", "enforce_claims", True))
+    if enforce_temp_interlock is None:
+        enforce_temp_interlock = bool(
+            _config.get("service", "enforce_temp_interlock", True)
+        )
 
-    service = PlateLocService(dry_run=dry_run, enforce_claims=enforce_claims)
+    service = PlateLocService(
+        dry_run=dry_run,
+        enforce_claims=enforce_claims,
+        enforce_temp_interlock=enforce_temp_interlock,
+    )
     startup_timeout = float(_config.get("service", "startup_connect_timeout_s", 15.0))
 
     @asynccontextmanager
@@ -184,7 +197,7 @@ def create_app(
 
     app = FastAPI(
         title="Agilent PlateLoc Sealer API",
-        version="1.1.0",
+        version="1.2.1",
         description=(
             "REST API for the Agilent PlateLoc Thermal Microplate Sealer. "
             "Conforms to the AC lab equipment status spec v1.1 - see the "
@@ -322,6 +335,7 @@ def create_app(
             await service.startup(profile=req.profile)
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(ok=True, message="Connected")
 
     @app.post("/control/shutdown", response_model=CommandResponse, tags=["control"])
@@ -329,6 +343,7 @@ def create_app(
         _claim: None = Depends(require_claim),
     ) -> CommandResponse:
         await service.shutdown()
+        service.clear_last_error_on_success()
         return CommandResponse(ok=True, message="Disconnected")
 
     @app.post(
@@ -346,6 +361,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(message=f"Set sealing temperature to {req.temperature_c} C")
 
     @app.post(
@@ -363,11 +379,13 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(message=f"Set sealing time to {req.seconds} s")
 
     @app.post(
         "/control/seal/start",
         response_model=CommandResponse,
+        responses={412: {"description": "Heater not at setpoint"}},
         tags=["control"],
     )
     async def control_seal_start(
@@ -380,10 +398,29 @@ def create_app(
             if req.seconds is not None:
                 await service.set_sealing_time(req.seconds)
             await service.start_cycle()
+        except TemperatureOutOfBand as exc:
+            # Layer-1 interlock refusal. Returned as top-level JSON so
+            # callers can read ``response.json()["retry_after_s"]``
+            # without unwrapping a ``detail`` envelope. ``Retry-After``
+            # is set in seconds when we have an estimate.
+            payload: dict[str, Any] = {
+                "detail": str(exc),
+                "actual_c": exc.actual_c,
+                "setpoint_c": exc.setpoint_c,
+                "tolerance_c": exc.tolerance_c,
+                "retry_after_s": exc.retry_after_s,
+            }
+            headers: dict[str, str] = {}
+            if exc.retry_after_s is not None:
+                headers["Retry-After"] = str(int(exc.retry_after_s))
+            raise _ClaimResponseException(
+                status_code=412, payload=payload, headers=headers
+            )
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(message="Seal cycle started")
 
     @app.post(
@@ -400,6 +437,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(message="Seal cycle stopped")
 
     @app.post(
@@ -416,6 +454,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(message="Stage moving in")
 
     @app.post(
@@ -432,6 +471,7 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
+        service.clear_last_error_on_success()
         return CommandResponse(message="Stage moving out")
 
     # Expose service for tests/debugging.

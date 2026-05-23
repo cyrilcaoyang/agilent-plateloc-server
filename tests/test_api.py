@@ -245,6 +245,343 @@ def test_temperature_setpoint_persists(client: TestClient) -> None:
     assert body["metrics"]["setpoint_temperature"]["value"] == 145
 
 
+# ---------------------------------------------------------------------------
+# Layer-1 temperature interlock (see docs/INTERLOCKS.md in ac-organic-lab)
+# ---------------------------------------------------------------------------
+
+
+def _build_claimed_client(*, enforce_temp_interlock: bool) -> tuple:
+    """Spin up a service with the dry-run stub injected (so the
+    operational state machine runs, not the dry_run shortcut), acquire
+    a claim, and return ``(client, driver)`` so tests can mutate the
+    stub's temperatures directly."""
+    from agilent_plateloc.api import create_app
+    from agilent_plateloc.service import _StubPlateLoc
+
+    app = create_app(
+        dry_run=False,
+        enforce_claims=True,
+        enforce_temp_interlock=enforce_temp_interlock,
+    )
+    app.state.service._driver_factory = _StubPlateLoc
+    c = TestClient(app)
+    c.__enter__()
+    r = c.post(
+        "/control/claim",
+        json={"owner": "pytest", "session_id": "interlock-test", "ttl_s": 60},
+    )
+    c.headers["X-Claim-Token"] = r.json()["claim_token"]
+    c.post("/control/startup", json={})
+    driver = app.state.service._driver
+    return c, driver
+
+
+def test_seal_start_in_band_succeeds() -> None:
+    """Heater at setpoint -> cycle accepted with HTTP 200."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        # Stub snaps actual to setpoint on set_sealing_temperature, so
+        # we are at-setpoint by construction.
+        r = c.post(
+            "/control/seal/start",
+            json={"temperature_c": 170, "seconds": 3.0},
+        )
+        assert r.status_code == 200, r.text
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_seal_start_out_of_band_returns_412() -> None:
+    """Heater below setpoint -> cycle refused with HTTP 412 and a
+    structured body."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        # Set the setpoint, then drag the stub's actual temperature
+        # well below the band the stub would otherwise report.
+        c.post("/control/seal/temperature", json={"temperature_c": 170})
+        driver._actual_temp = 150  # 20 C below setpoint, tolerance is 2
+
+        r = c.post(
+            "/control/seal/start",
+            json={"seconds": 3.0},  # no temperature_c -> keep setpoint
+        )
+        assert r.status_code == 412, r.text
+        body = r.json()
+        assert body["detail"] == "Temperature outside seal band"
+        assert body["actual_c"] == 150.0
+        assert body["setpoint_c"] == 170.0
+        assert body["tolerance_c"] == 2.0
+        assert body["retry_after_s"] is not None
+        assert body["retry_after_s"] > 0
+        # Retry-After header should mirror the body field.
+        assert r.headers.get("Retry-After") == str(int(body["retry_after_s"]))
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_seal_start_out_of_band_passes_when_interlock_disabled() -> None:
+    """With ``enforce_temp_interlock=False`` the device restores the
+    pre-interlock behavior: out-of-band seal cycles are accepted. This
+    is the emergency-override path; production stays True."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=False)
+    try:
+        c.post("/control/seal/temperature", json={"temperature_c": 170})
+        driver._actual_temp = 150
+
+        r = c.post(
+            "/control/seal/start",
+            json={"seconds": 3.0},
+        )
+        assert r.status_code == 200, r.text
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_seal_start_when_temperature_unreadable_returns_412() -> None:
+    """If actual or setpoint cannot be read, the interlock refuses
+    rather than guessing the device is safe to seal."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        # Force the stub to misreport actual as unreadable. Patching
+        # the method is cleaner than subclassing the stub for one test.
+        driver.get_actual_temperature = lambda: None  # type: ignore[method-assign]
+
+        r = c.post(
+            "/control/seal/start",
+            json={"temperature_c": 170, "seconds": 3.0},
+        )
+        assert r.status_code == 412, r.text
+        body = r.json()
+        assert "Cannot verify temperature" in body["detail"]
+        assert body["actual_c"] is None
+        assert body["retry_after_s"] is None
+        assert "Retry-After" not in r.headers
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_allowed_actions_drops_seal_start_when_out_of_band() -> None:
+    """v1.2.1: ``/status`` must drop ``seal.start`` from
+    ``allowed_actions`` when the temperature interlock would refuse
+    a POST.
+
+    Defends the v0.4 workflow path where SDK clients consume
+    ``allowed_actions`` verbatim — without this gate they would still
+    attempt the call and eat a 412.
+    """
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        c.post("/control/seal/temperature", json={"temperature_c": 170})
+        driver._actual_temp = 150  # 20 C below setpoint, tolerance is 2
+
+        body = c.get("/status").json()
+        assert "seal.start" not in body["allowed_actions"]
+        # Sibling actions still present.
+        assert "stage.in" in body["allowed_actions"]
+        assert "stage.out" in body["allowed_actions"]
+        assert "shutdown" in body["allowed_actions"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_allowed_actions_drops_seal_start_when_heater_heating() -> None:
+    """heater.state == 'heating' implies the band check fails.
+    The two surfaces (heater state + allowed_actions) must agree."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        c.post("/control/seal/temperature", json={"temperature_c": 170})
+        driver._actual_temp = 100  # well below setpoint
+
+        body = c.get("/status").json()
+        assert body["components"]["heater"]["state"] == "heating"
+        assert "seal.start" not in body["allowed_actions"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_allowed_actions_drops_seal_start_when_unreadable() -> None:
+    """Fail-closed: if actual or setpoint cannot be read, seal.start
+    is absent from ``allowed_actions`` (matching the 412 path)."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        driver.get_actual_temperature = lambda: None  # type: ignore[method-assign]
+
+        body = c.get("/status").json()
+        assert "seal.start" not in body["allowed_actions"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_allowed_actions_keeps_seal_start_when_interlock_disabled() -> None:
+    """``enforce_temp_interlock=False`` → seal.start is in
+    ``allowed_actions`` whenever the state would otherwise allow it,
+    regardless of heater state or band."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=False)
+    try:
+        c.post("/control/seal/temperature", json={"temperature_c": 170})
+        driver._actual_temp = 50  # way out of band
+
+        body = c.get("/status").json()
+        assert body["equipment_status"] == "ready"
+        assert "seal.start" in body["allowed_actions"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_allowed_actions_agrees_with_412_path() -> None:
+    """For each blocked scenario, ``/status`` omits ``seal.start`` iff
+    a POST to ``/control/seal/start`` returns 412.
+
+    This is the contract that closes the v0.4 gap: the SDK gate
+    (advisory) and the device gate (authoritative) must never disagree.
+    """
+    scenarios = [
+        ("heating: actual << setpoint", lambda d: setattr(d, "_actual_temp", 100)),
+        ("cooling: actual >> setpoint", lambda d: setattr(d, "_actual_temp", 250)),
+        (
+            "actual unreadable",
+            lambda d: setattr(
+                d, "get_actual_temperature", lambda: None  # type: ignore[method-assign]
+            ),
+        ),
+        (
+            "setpoint unreadable",
+            lambda d: setattr(
+                d, "get_sealing_temperature", lambda: None  # type: ignore[method-assign]
+            ),
+        ),
+    ]
+    for label, mutate in scenarios:
+        c, driver = _build_claimed_client(enforce_temp_interlock=True)
+        try:
+            c.post("/control/seal/temperature", json={"temperature_c": 170})
+            mutate(driver)
+
+            status_omits = "seal.start" not in c.get("/status").json()["allowed_actions"]
+            post_refuses = (
+                c.post("/control/seal/start", json={"seconds": 3.0}).status_code == 412
+            )
+
+            assert status_omits, f"{label}: /status should omit seal.start"
+            assert post_refuses, f"{label}: POST should return 412"
+            assert status_omits == post_refuses, f"{label}: surfaces disagreed"
+        finally:
+            c.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# last_error auto-clear on first successful action (v1.2.1)
+# ---------------------------------------------------------------------------
+
+
+def _provoke_error(driver) -> None:  # type: ignore[no-untyped-def]
+    """Drive the stub into a recorded ``last_error`` by replacing
+    ``move_stage_in`` with a method that raises a non-``RuntimeError``
+    exception (mirrors real ActiveX COM faults, which surface as
+    ``pywintypes.com_error``, not ``RuntimeError``). The API layer maps
+    those to HTTP 500; ``RuntimeError`` would map to 409 instead.
+    Returns nothing; the caller asserts ``last_error`` is populated."""
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise OSError("Low Air Pressure (simulated COM fault)")
+
+    driver.move_stage_in = _boom
+
+
+def test_last_error_clears_on_next_successful_action() -> None:
+    """After a control failure, the first successful action that
+    follows clears ``last_error`` before the response is built."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _provoke_error(driver)
+        r = c.post("/control/stage/in")
+        assert r.status_code == 500
+        assert c.get("/status").json()["last_error"] is not None
+
+        # stage.out does not need the failing path; first 2xx → cleared.
+        r = c.post("/control/stage/out")
+        assert r.status_code == 200, r.text
+        assert c.get("/status").json()["last_error"] is None
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_preserved_on_412_refusal() -> None:
+    """A 412 refusal is not a recovery — ``last_error`` must persist.
+
+    Drives the band check fail by mutating the stub directly; avoiding
+    a successful ``/control/seal/temperature`` call which would itself
+    clear ``last_error`` and mask the bug under test.
+    """
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _provoke_error(driver)
+        c.post("/control/stage/in")
+        body = c.get("/status").json()
+        assert body["last_error"] is not None
+        original_message = body["last_error"]["message"]
+
+        # _build_claimed_client startup() already snaps _actual_temp to
+        # _set_temp=170; drag actual below band without a 2xx round trip.
+        driver._actual_temp = 150
+        r = c.post("/control/seal/start", json={"seconds": 3.0})
+        assert r.status_code == 412
+
+        body = c.get("/status").json()
+        assert body["last_error"] is not None
+        assert body["last_error"]["message"] == original_message
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_preserved_on_heartbeat() -> None:
+    """Claim infrastructure must not clear operational error state."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _provoke_error(driver)
+        c.post("/control/stage/in")
+        assert c.get("/status").json()["last_error"] is not None
+
+        # heartbeat returns 200 with a fresh ClaimResponse body.
+        r = c.post("/control/heartbeat")
+        assert r.status_code == 200, r.text
+
+        assert c.get("/status").json()["last_error"] is not None
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_not_cleared_by_status_get() -> None:
+    """Read-only endpoints must not mutate ``last_error``."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _provoke_error(driver)
+        c.post("/control/stage/in")
+        assert c.get("/status").json()["last_error"] is not None
+
+        for _ in range(5):
+            c.get("/status")
+        assert c.get("/status").json()["last_error"] is not None
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_clears_on_successful_shutdown() -> None:
+    """``/control/shutdown`` is an operational endpoint; a 2xx response
+    drives the device into a quiescent state and clears the error."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _provoke_error(driver)
+        c.post("/control/stage/in")
+        assert c.get("/status").json()["last_error"] is not None
+
+        r = c.post("/control/shutdown")
+        assert r.status_code == 200, r.text
+        assert c.get("/status").json()["last_error"] is None
+    finally:
+        c.__exit__(None, None, None)
+
+
 def test_shutdown_then_control_returns_409(client: TestClient) -> None:
     """Spec-friendly behaviour: control endpoints fail with 409 (not 500)
     when the driver isn't connected, so the operator UI can render a
@@ -288,8 +625,9 @@ def test_save_status_fixtures(unclaimed_client: TestClient) -> None:
 
     Coverage:
       - status_requires_init.json   - hardware not connected (spec example)
-      - status_ready.json           - connected & idle (uses stub driver)
+      - status_ready.json           - connected & idle, seal.start present
       - status_ready_claimed.json   - same, but with details.claimed_by
+      - status_ready_heating.json   - heater below band, seal.start ABSENT
       - status_busy.json            - cycle in progress (uses stub driver)
       - status_dry_run.json         - dry-run mode advertised in /status
     """
@@ -334,6 +672,30 @@ def test_save_status_fixtures(unclaimed_client: TestClient) -> None:
         body = alt.get("/status").json()
         assert "claimed_by" not in body["details"]
         (FIXTURES / "status_ready.json").write_text(
+            json.dumps(_scrub_for_diff(body), indent=2, sort_keys=True) + "\n"
+        )
+
+        # heating snapshot: setpoint above actual by more than tolerance.
+        # Re-acquire the claim because the previous block released it.
+        r = alt.post(
+            "/control/claim",
+            json={
+                "owner": "fixture",
+                "session_id": "fixture-session",
+                "ttl_s": 60,
+            },
+        )
+        alt.headers["X-Claim-Token"] = r.json()["claim_token"]
+        # Bump the setpoint without changing actual: the stub's
+        # set_sealing_temperature normally snaps actual to setpoint, so
+        # we mutate _set_temp directly to keep the band check failing.
+        heating_driver = app.state.service._driver
+        heating_driver._set_temp = 170
+        heating_driver._actual_temp = 80  # 90 C below setpoint (tol=2)
+        body = alt.get("/status").json()
+        assert body["equipment_status"] == "ready"
+        assert "seal.start" not in body["allowed_actions"]
+        (FIXTURES / "status_ready_heating.json").write_text(
             json.dumps(_scrub_for_diff(body), indent=2, sort_keys=True) + "\n"
         )
 

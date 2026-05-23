@@ -85,6 +85,19 @@ _ALLOWED_ACTIONS_BY_STATE: dict[str, list[str]] = {
 }
 
 
+def _coerce_float(value: Any) -> float | None:
+    """Best-effort cast to ``float`` for ActiveX values that can be ``None``,
+    ``int``, ``float``, or a parseable string. Returns ``None`` if the
+    value cannot be coerced — callers treat that as "temperature
+    unavailable" and fail closed."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Stub driver for dry-run / non-Windows development
 # ---------------------------------------------------------------------------
@@ -167,6 +180,31 @@ class _StubPlateLoc:
 _RECENT_ERROR_WINDOW_S = 60.0  # how long an error keeps the device in `error`
 
 
+class TemperatureOutOfBand(Exception):
+    """Raised by ``start_cycle`` when the heater is not at setpoint.
+
+    Layer-1 interlock from ``docs/INTERLOCKS.md``: the device refuses to
+    start a seal cycle when ``abs(actual - setpoint) > tolerance``.
+    Carries enough structured data for the API layer to emit a clean
+    HTTP 412 body without re-querying the driver.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        actual_c: float | None,
+        setpoint_c: float | None,
+        tolerance_c: float,
+        retry_after_s: float | None,
+    ) -> None:
+        super().__init__(message)
+        self.actual_c = actual_c
+        self.setpoint_c = setpoint_c
+        self.tolerance_c = tolerance_c
+        self.retry_after_s = retry_after_s
+
+
 class PlateLocService:
     """Wraps a ``PlateLoc`` (or ``_StubPlateLoc``) driver and produces
     spec-compliant ``EquipmentStatus`` snapshots.
@@ -181,6 +219,7 @@ class PlateLocService:
         *,
         driver_factory: Callable[[], Any] | None = None,
         enforce_claims: bool = True,
+        enforce_temp_interlock: bool = True,
     ) -> None:
         """
         Parameters
@@ -200,6 +239,15 @@ class PlateLocService:
             v1.1 *advisory* claims (the device still publishes
             ``allowed_actions`` and ``details.claimed_by`` but does not
             block writes from clients without a token).
+        enforce_temp_interlock:
+            Layer-1 interlock (see ``docs/INTERLOCKS.md``). When True
+            (default), ``start_cycle`` raises ``TemperatureOutOfBand`` if
+            the heater is not within ``temperature_tolerance_c`` of the
+            setpoint, which the API surfaces as HTTP 412. Set False only
+            for emergency overrides (e.g. calibration at room
+            temperature) — running with this off restores the failure
+            mode where sealing below setpoint produces an underspec'd
+            seal and downstream pneumatic faults.
         """
         self.dry_run = dry_run
         self._driver_factory = driver_factory
@@ -210,7 +258,18 @@ class PlateLocService:
         self._busy_state: bool = False
         self._connect_profile: str | None = None
         self.enforce_claims = enforce_claims
+        self.enforce_temp_interlock = enforce_temp_interlock
         self.claims = ClaimStore()
+
+        # Tolerance (in C) inside which `actual_temperature` is considered
+        # to have reached `setpoint_temperature`. Mirrors what `demo.py`
+        # uses for its temperature-wait loop, so the device speaks the
+        # same language as the operator-facing demo. The ActiveX control
+        # does not expose a native "temperature stable" signal; we
+        # synthesize it by comparing the two metrics.
+        self._temp_tolerance_c: float = float(
+            _config.get("film", "temperature_tolerance_c", 2)
+        )
 
         # Identity (configurable so a deployment can override).
         self.equipment_id: str = _config.get("dashboard", "equipment_id", "plateloc")
@@ -241,6 +300,10 @@ class PlateLocService:
         On failure, leaves the service in `requires_init` and re-raises
         so callers (lifespan / `/control/startup`) can decide whether to
         log-and-continue or surface a 503.
+
+        Does NOT clear ``self._last_error`` on success: the API layer
+        owns that policy and clears only when the overall endpoint
+        response is 2xx (see :meth:`clear_last_error_on_success`).
         """
         async with self._lock:
             if self._driver is not None and self._driver_connected():
@@ -249,14 +312,23 @@ class PlateLocService:
             self._connect_profile = profile
             try:
                 await asyncio.to_thread(self._driver.connect, profile)
-                self._last_error = None
             except Exception as exc:
-                self._record_error(exc, "startup")
+                # `connect()` already calls get_last_error() and folds the
+                # detail into the exception text on the Initialize-failed
+                # path, but other startup failures (driver-create, ATL
+                # hosting, surrogate exit) won't carry that string. Best-
+                # effort enrich here too.
+                detail = await self._read_driver_last_error()
+                self._record_error(exc, "startup", detail=detail)
                 # keep self._driver around so retries reuse the same instance
                 raise
 
     async def shutdown(self) -> None:
-        """Best-effort disconnect. Never raises."""
+        """Best-effort disconnect. Never raises.
+
+        Does NOT clear ``self._last_error`` — the API layer owns that
+        policy (see :meth:`clear_last_error_on_success`).
+        """
         async with self._lock:
             if self._driver is None:
                 return
@@ -283,8 +355,114 @@ class PlateLocService:
         )
 
     async def start_cycle(self) -> None:
-        await self._do("start_cycle", lambda d: d.start_cycle())
+        """Start a seal cycle.
+
+        Layer-1 interlock: when ``enforce_temp_interlock`` is True (the
+        default) this raises :class:`TemperatureOutOfBand` *before*
+        commanding the hardware if the heater is not within
+        ``temperature_tolerance_c`` of the setpoint. The check, the read
+        of actual/setpoint, and the driver call all happen under the
+        same lock so a concurrent ``set_sealing_temperature`` cannot
+        race the precondition.
+        """
+        # Inlined (not via ``_do``) so the precondition check and the
+        # ``StartCycle`` COM call sit inside a single critical section.
+        async with self._lock:
+            if self._driver is None or not self._driver_connected():
+                raise RuntimeError(
+                    "PlateLoc is not connected. POST /control/startup first."
+                )
+            await self._assert_temperature_in_band()
+            try:
+                await asyncio.to_thread(self._driver.start_cycle)
+            except Exception as exc:
+                detail = await self._read_driver_last_error()
+                self._record_error(exc, "start_cycle", detail=detail)
+                raise
         self._busy_state = True
+
+    def evaluate_temperature_interlock(
+        self,
+        actual: float | None,
+        setpoint: float | None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Single source of truth for the layer-1 temperature interlock.
+
+        Returns ``(should_block, body_for_412)``:
+
+        * ``should_block`` is ``False`` when the heater is at setpoint
+          within ``self._temp_tolerance_c`` (the seal cycle would be
+          honoured) **or** when ``enforce_temp_interlock`` is disabled.
+          In both cases ``body_for_412`` is ``None``.
+        * ``should_block`` is ``True`` when the band check fails or
+          when the temperatures cannot be read (fail-closed). The
+          returned ``body_for_412`` is the structured JSON body that
+          ``/control/seal/start`` returns with HTTP 412 — building it
+          here keeps the ``/status`` ``allowed_actions`` gate and the
+          412 refusal path on the same single answer.
+        """
+        if not self.enforce_temp_interlock:
+            return False, None
+
+        tolerance = self._temp_tolerance_c
+
+        if actual is None or setpoint is None:
+            return True, {
+                "detail": "Cannot verify temperature: actual or setpoint unavailable",
+                "actual_c": actual,
+                "setpoint_c": setpoint,
+                "tolerance_c": tolerance,
+                "retry_after_s": None,
+            }
+
+        delta = actual - setpoint
+        if abs(delta) <= tolerance:
+            return False, None
+
+        # Best-effort retry estimate. PlateLoc heat-up is faster than
+        # cool-down on the hot-plate; the constants below are
+        # conservative averages, not measured ramps, and intentionally
+        # round up so callers don't hot-poll. None is also a valid
+        # answer; we always provide a number here so the dashboard can
+        # render "try again in ~N s".
+        excess = abs(delta) - tolerance
+        ramp_c_per_s = 1.0 if delta < 0 else 0.3
+        retry_after_s = max(1.0, round(excess / ramp_c_per_s + 0.5))
+
+        return True, {
+            "detail": "Temperature outside seal band",
+            "actual_c": actual,
+            "setpoint_c": setpoint,
+            "tolerance_c": tolerance,
+            "retry_after_s": retry_after_s,
+        }
+
+    async def _assert_temperature_in_band(self) -> None:
+        """Raise :class:`TemperatureOutOfBand` if the temperature
+        interlock would block a seal cycle right now.
+
+        Caller MUST already hold ``self._lock``. Uses ``asyncio.to_thread``
+        for the (blocking) COM reads so the event loop is not pinned
+        while the surrogate replies. The decision itself is delegated
+        to :meth:`evaluate_temperature_interlock` so this path stays in
+        lockstep with the ``/status`` ``allowed_actions`` gate.
+        """
+        actual_raw = await asyncio.to_thread(self._driver.get_actual_temperature)
+        setpoint_raw = await asyncio.to_thread(self._driver.get_sealing_temperature)
+
+        blocks, body = self.evaluate_temperature_interlock(
+            _coerce_float(actual_raw), _coerce_float(setpoint_raw)
+        )
+        if not blocks:
+            return
+        assert body is not None  # invariant: blocks=True implies a body
+        raise TemperatureOutOfBand(
+            body["detail"],
+            actual_c=body["actual_c"],
+            setpoint_c=body["setpoint_c"],
+            tolerance_c=body["tolerance_c"],
+            retry_after_s=body["retry_after_s"],
+        )
 
     async def stop_cycle(self) -> None:
         await self._do("stop_cycle", lambda d: d.stop_cycle())
@@ -304,10 +482,35 @@ class PlateLocService:
                 )
             try:
                 await asyncio.to_thread(fn, self._driver)
-                self._last_error = None
             except Exception as exc:
-                self._record_error(exc, name)
+                # Best-effort: pull the human-readable message out of the
+                # ActiveX control via GetLastError so operators see what
+                # the instrument actually reported instead of just the
+                # generic Agilent HRESULT (e.g. -2147221503 = 0x80040201).
+                detail = await self._read_driver_last_error()
+                self._record_error(exc, name, detail=detail)
                 raise
+
+    async def _read_driver_last_error(self) -> str | None:
+        """Return ``driver.get_last_error()`` if the driver has it, else None.
+
+        Wrapped so the error-handling path can never itself crash on a
+        broken / stub driver. Called from inside ``self._lock``.
+        """
+        driver = self._driver
+        if driver is None:
+            return None
+        getter = getattr(driver, "get_last_error", None)
+        if getter is None:
+            return None
+        try:
+            result = await asyncio.to_thread(getter)
+        except Exception:
+            return None
+        if result is None:
+            return None
+        text = str(result).strip()
+        return text or None
 
     # ---- status (side-effect-free) ----------------------------------------
 
@@ -379,6 +582,23 @@ class PlateLocService:
             metrics["setpoint_temperature"] = MetricValue(
                 value=setpoint, unit="C", timestamp=now
             )
+
+        # Synthesized: signed delta and heater state. The ActiveX has no
+        # native "ready to seal" signal so the device computes it from
+        # the two raw metrics using the operator-facing tolerance. delta
+        # is `actual - setpoint`, so a negative value means "still heating
+        # up", positive means "above setpoint / cooling".
+        actual_f = _coerce_float(actual_temp)
+        setpoint_f = _coerce_float(setpoint)
+        heater_temp_delta: float | None
+        if actual_f is not None and setpoint_f is not None:
+            heater_temp_delta = actual_f - setpoint_f
+        else:
+            heater_temp_delta = None
+        if heater_temp_delta is not None:
+            metrics["temperature_delta_c"] = MetricValue(
+                value=round(heater_temp_delta, 1), unit="C", timestamp=now
+            )
         seal_time = _read("sealing_time", self._driver.get_sealing_time)
         if seal_time is not None:
             metrics["sealing_time"] = MetricValue(
@@ -405,15 +625,51 @@ class PlateLocService:
         sealer_state = (
             "busy" if self._busy_state else ("idle" if connected else "disconnected")
         )
+
+        # Heater state is derived from the temperature delta against the
+        # configured tolerance. "stable" means the plate is at setpoint
+        # within +/- temperature_tolerance_c and a seal cycle would seal
+        # at the requested temperature. "heating"/"cooling" mean it is
+        # not yet there. "unknown" covers the case where one of the
+        # readings could not be obtained.
+        if not connected:
+            heater_state = "disconnected"
+            heater_message: str | None = None
+        elif heater_temp_delta is None:
+            heater_state = "unknown"
+            heater_message = None
+        elif abs(heater_temp_delta) <= self._temp_tolerance_c:
+            heater_state = "stable"
+            heater_message = f"At setpoint ({actual_temp} C)"
+        elif heater_temp_delta < 0:
+            heater_state = "heating"
+            heater_message = f"Heating {actual_temp} -> {setpoint} C"
+        else:
+            heater_state = "cooling"
+            heater_message = f"Cooling {actual_temp} -> {setpoint} C"
+
         components: dict[str, ComponentStatus] = {
             "sealer": ComponentStatus(
                 connected=connected,
                 state=sealer_state,
             ),
+            "heater": ComponentStatus(
+                connected=connected,
+                state=heater_state,
+                message=heater_message,
+                # last_event_at is intentionally None: it should be the
+                # time of the last *transition* (e.g. heating -> stable),
+                # not the poll timestamp. Wire that up when we have a
+                # transition tracker.
+            ),
             # The ActiveX control does not expose a stage position query,
             # so we report it as `unknown` until events are wired in.
             "stage": ComponentStatus(connected=connected, state="unknown"),
         }
+
+        # Tell readers what tolerance defines "stable" so a dashboard or
+        # workflow can render the delta meaningfully without guessing.
+        details["temperature_tolerance_c"] = self._temp_tolerance_c
 
         # ---- top-level equipment_status ----------------------------------
         if self.dry_run:
@@ -436,6 +692,20 @@ class PlateLocService:
             state = "ready"
             message = "Idle, ready to seal"
 
+        # ---- allowed_actions ---------------------------------------------
+        # Start from the state-derived defaults, then drop seal.start when
+        # the temperature interlock would refuse it. This MUST consult
+        # the same helper as the /control/seal/start 412 path or
+        # workflow clients that trust allowed_actions verbatim will
+        # round-trip into a 412 they could have avoided.
+        allowed_actions = list(_ALLOWED_ACTIONS_BY_STATE.get(state, []))
+        if state in ("ready", "dry_run") and "seal.start" in allowed_actions:
+            blocks, _body = self.evaluate_temperature_interlock(
+                actual_f, setpoint_f
+            )
+            if blocks:
+                allowed_actions.remove("seal.start")
+
         return EquipmentStatus(
             protocol_version=PROTOCOL_VERSION,
             equipment_id=self.equipment_id,
@@ -445,7 +715,7 @@ class PlateLocService:
             host=host,
             equipment_status=state,  # type: ignore[arg-type]
             message=message,
-            allowed_actions=list(_ALLOWED_ACTIONS_BY_STATE.get(state, [])),
+            allowed_actions=allowed_actions,
             device_time=now,
             uptime_seconds=uptime,
             components=components,
@@ -465,14 +735,55 @@ class PlateLocService:
             return False
         return bool(getattr(self._driver, "_connected", False))
 
-    def _record_error(self, exc: Exception, code: str) -> None:
+    def clear_last_error_on_success(self) -> None:
+        """Drop ``self._last_error`` after a 2xx operational response.
+
+        Policy (single source of truth — see README "Safety interlocks"):
+
+        * Called by every operational ``/control/*`` endpoint right
+          before it returns a 2xx response (startup, shutdown,
+          seal.start, seal.stop, seal.set_temperature, seal.set_time,
+          stage.in, stage.out). Doing this at the API layer — not
+          inside the service methods — means a refusal mid-endpoint
+          (e.g. ``set_sealing_time`` succeeds then ``start_cycle``
+          raises 412) does NOT clear: only an *overall* 2xx clears.
+        * NOT called on 4xx / 5xx responses. A 412 from the temperature
+          interlock is a refusal, not a recovery; ``last_error`` keeps
+          its relevance.
+        * NOT called by ``/control/claim``, ``/control/heartbeat``, or
+          ``/control/release``: those are claim infrastructure, not
+          operational progress, and clearing on them would hide
+          ``last_error`` during a heartbeat-only retry loop.
+        * NOT called by ``/status``, ``/``, or ``/health`` — those are
+          read-only and must not mutate state.
+
+        Concurrency: attribute assignment is atomic in CPython, so
+        this method does NOT take ``self._lock``. A concurrent
+        ``/status`` poll between the lock release and this clear sees
+        the old value, which is the same staleness already inherent in
+        polling.
+        """
+        self._last_error = None
+
+    def _record_error(
+        self, exc: Exception, code: str, *, detail: str | None = None
+    ) -> None:
+        message = str(exc)
+        if detail and detail not in message:
+            # The driver-reported text is what makes 0x80040201 actionable
+            # ("Could not initialize - No response from PlateLoc",
+            # "Stage cannot move - press is down", etc.). Append it once.
+            message = f"{message} (driver: {detail})"
         self._last_error = ErrorInfo(
             code=code,
-            message=str(exc),
+            message=message,
             severity="error",
             timestamp=datetime.now(timezone.utc),
         )
-        logger.exception("PlateLoc error in %s", code)
+        if detail:
+            logger.exception("PlateLoc error in %s (driver: %s)", code, detail)
+        else:
+            logger.exception("PlateLoc error in %s", code)
 
 
-__all__ = ["PlateLocService", "_StubPlateLoc"]
+__all__ = ["PlateLocService", "TemperatureOutOfBand", "_StubPlateLoc"]

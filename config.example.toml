@@ -36,6 +36,11 @@ enforce_claims = true                       # v1.1: require X-Claim-Token on /co
                                             #           does not block writes; useful when
                                             #           an existing v1.0 operator UI has
                                             #           not yet learned to acquire a claim)
+enforce_temp_interlock = true               # Layer-1 safety: refuse /control/seal/start
+                                            # with HTTP 412 when abs(actual - setpoint)
+                                            # > [film].temperature_tolerance_c. Leave
+                                            # true in production; set false only for
+                                            # emergency overrides (e.g. cold calibration).
 
 # ── Dashboard identity ──────────────────────────────────────────────
 # Reported in GET /status. Must match the entry in the dashboard's

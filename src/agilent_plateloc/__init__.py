@@ -26,7 +26,7 @@ Usage::
 from .plateloc import PlateLoc
 
 __all__ = ["PlateLoc"]
-__version__ = "1.0.0"
+__version__ = "1.2.1"
 
 # The service / FastAPI app live in `agilent_plateloc.service` and
 # `agilent_plateloc.api` and are imported on demand to avoid pulling in
