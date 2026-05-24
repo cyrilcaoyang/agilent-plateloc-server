@@ -6,7 +6,6 @@
     "seal.stop",
     "seal.set_temperature",
     "seal.set_time",
-    "stage.in",
     "stage.out"
   ],
   "components": {
@@ -26,7 +25,7 @@
       "connected": true,
       "last_event_at": null,
       "message": null,
-      "state": "unknown"
+      "state": "in"
     }
   },
   "details": {

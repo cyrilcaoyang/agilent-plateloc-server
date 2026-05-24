@@ -59,7 +59,7 @@ from .models import (
     HealthResponse,
     ProbeResponse,
 )
-from .service import PlateLocService, TemperatureOutOfBand
+from .service import PlateLocService, StageNotLoaded, TemperatureOutOfBand
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,7 @@ def create_app(
     dry_run: bool | None = None,
     enforce_claims: bool | None = None,
     enforce_temp_interlock: bool | None = None,
+    enforce_stage_interlock: bool | None = None,
 ) -> FastAPI:
     """Build the FastAPI application.
 
@@ -149,6 +150,12 @@ def create_app(
         Layer-1 temperature interlock. ``None`` means "use the config
         file" (default ``True``). When True, ``/control/seal/start``
         returns HTTP 412 if ``abs(actual - setpoint) > tolerance``.
+    enforce_stage_interlock:
+        Layer-1 stage-position interlock (v1.3.0). ``None`` means "use
+        the config file" (default ``True``). When True,
+        ``/control/seal/start`` returns HTTP 412 if the stage is not
+        in the loaded position. Independent of
+        ``enforce_temp_interlock``.
     """
 
     if dry_run is None:
@@ -159,11 +166,16 @@ def create_app(
         enforce_temp_interlock = bool(
             _config.get("service", "enforce_temp_interlock", True)
         )
+    if enforce_stage_interlock is None:
+        enforce_stage_interlock = bool(
+            _config.get("service", "enforce_stage_interlock", True)
+        )
 
     service = PlateLocService(
         dry_run=dry_run,
         enforce_claims=enforce_claims,
         enforce_temp_interlock=enforce_temp_interlock,
+        enforce_stage_interlock=enforce_stage_interlock,
     )
     startup_timeout = float(_config.get("service", "startup_connect_timeout_s", 15.0))
 
@@ -197,7 +209,7 @@ def create_app(
 
     app = FastAPI(
         title="Agilent PlateLoc Sealer API",
-        version="1.2.1",
+        version="1.3.0",
         description=(
             "REST API for the Agilent PlateLoc Thermal Microplate Sealer. "
             "Conforms to the AC lab equipment status spec v1.1 - see the "
@@ -385,7 +397,16 @@ def create_app(
     @app.post(
         "/control/seal/start",
         response_model=CommandResponse,
-        responses={412: {"description": "Heater not at setpoint"}},
+        responses={
+            412: {
+                "description": (
+                    "Layer-1 interlock refusal. Body is one of: "
+                    "stage-not-loaded (no Retry-After) or "
+                    "temperature-out-of-band (Retry-After in seconds when "
+                    "an estimate is available)."
+                )
+            }
+        },
         tags=["control"],
     )
     async def control_seal_start(
@@ -398,11 +419,25 @@ def create_app(
             if req.seconds is not None:
                 await service.set_sealing_time(req.seconds)
             await service.start_cycle()
+        except StageNotLoaded as exc:
+            # Layer-1 stage interlock refusal (v1.3.0). Checked before
+            # the temperature interlock — see start_cycle docstring for
+            # the rationale. No Retry-After: recovery is operator-driven
+            # (POST /control/stage/in), not time-based.
+            raise _ClaimResponseException(
+                status_code=412,
+                payload={
+                    "detail": str(exc),
+                    "stage_state": exc.stage_state,
+                    "required": "in",
+                },
+            )
         except TemperatureOutOfBand as exc:
-            # Layer-1 interlock refusal. Returned as top-level JSON so
-            # callers can read ``response.json()["retry_after_s"]``
-            # without unwrapping a ``detail`` envelope. ``Retry-After``
-            # is set in seconds when we have an estimate.
+            # Layer-1 temperature interlock refusal. Returned as
+            # top-level JSON so callers can read
+            # ``response.json()["retry_after_s"]`` without unwrapping a
+            # ``detail`` envelope. ``Retry-After`` is set in seconds
+            # when we have an estimate.
             payload: dict[str, Any] = {
                 "detail": str(exc),
                 "actual_c": exc.actual_c,

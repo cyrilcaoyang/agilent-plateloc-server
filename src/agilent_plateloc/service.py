@@ -205,6 +205,27 @@ class TemperatureOutOfBand(Exception):
         self.retry_after_s = retry_after_s
 
 
+class StageNotLoaded(Exception):
+    """Raised by ``start_cycle`` when the plate stage is not in the
+    loaded ("in") position.
+
+    Layer-1 interlock (v1.3.0): the device refuses to start a seal
+    cycle unless ``components.stage.state == "in"``. The Agilent COM
+    API does not expose a stage-position query, so the position is
+    command-tracked and resets to ``"unknown"`` on process restart
+    or mid-cycle failure (the plate may have been moved manually
+    while the service was down — refusing safely beats guessing).
+
+    Carries the stage state at refusal time so the API layer can
+    emit ``{"detail", "stage_state", "required": "in"}`` without
+    re-reading service state.
+    """
+
+    def __init__(self, message: str, *, stage_state: str) -> None:
+        super().__init__(message)
+        self.stage_state = stage_state
+
+
 class PlateLocService:
     """Wraps a ``PlateLoc`` (or ``_StubPlateLoc``) driver and produces
     spec-compliant ``EquipmentStatus`` snapshots.
@@ -220,6 +241,7 @@ class PlateLocService:
         driver_factory: Callable[[], Any] | None = None,
         enforce_claims: bool = True,
         enforce_temp_interlock: bool = True,
+        enforce_stage_interlock: bool = True,
     ) -> None:
         """
         Parameters
@@ -248,6 +270,16 @@ class PlateLocService:
             temperature) — running with this off restores the failure
             mode where sealing below setpoint produces an underspec'd
             seal and downstream pneumatic faults.
+        enforce_stage_interlock:
+            Layer-1 interlock (v1.3.0). When True (default),
+            ``start_cycle`` raises ``StageNotLoaded`` if the stage is
+            not in the loaded position, which the API surfaces as
+            HTTP 412 with ``{"detail":"Stage not loaded","stage_state":
+            "out"|"unknown","required":"in"}``. Independent of
+            ``enforce_temp_interlock``. Set False only for emergency
+            overrides — running with this off restores the failure
+            mode where seal cycles run with the carriage extended,
+            wasting hot air and risking film damage.
         """
         self.dry_run = dry_run
         self._driver_factory = driver_factory
@@ -257,8 +289,14 @@ class PlateLocService:
         self._last_error: ErrorInfo | None = None
         self._busy_state: bool = False
         self._connect_profile: str | None = None
+        # Stage position is command-tracked (the COM API has no
+        # GetStagePosition equivalent). Defaults to "unknown" at process
+        # start; the operator homes it via /control/stage/{in,out}. See
+        # README "Stage interlock" for the full transition table.
+        self._stage_state: str = "unknown"
         self.enforce_claims = enforce_claims
         self.enforce_temp_interlock = enforce_temp_interlock
+        self.enforce_stage_interlock = enforce_stage_interlock
         self.claims = ClaimStore()
 
         # Tolerance (in C) inside which `actual_temperature` is considered
@@ -326,11 +364,17 @@ class PlateLocService:
     async def shutdown(self) -> None:
         """Best-effort disconnect. Never raises.
 
-        Does NOT clear ``self._last_error`` — the API layer owns that
-        policy (see :meth:`clear_last_error_on_success`).
+        Resets ``_stage_state`` to ``"unknown"`` — the next operator
+        cycle must re-home the carriage. Does NOT clear
+        ``self._last_error`` (the API layer owns that policy; see
+        :meth:`clear_last_error_on_success`).
         """
         async with self._lock:
             if self._driver is None:
+                # Even on the no-op path, stage state should reflect
+                # "we cannot vouch for the carriage position" — same
+                # rationale as a fresh process start.
+                self._stage_state = "unknown"
                 return
             try:
                 await asyncio.to_thread(self._driver.close)
@@ -339,6 +383,7 @@ class PlateLocService:
             finally:
                 self._driver = None
                 self._busy_state = False
+                self._stage_state = "unknown"
 
     # ---- control -----------------------------------------------------------
 
@@ -357,28 +402,51 @@ class PlateLocService:
     async def start_cycle(self) -> None:
         """Start a seal cycle.
 
-        Layer-1 interlock: when ``enforce_temp_interlock`` is True (the
-        default) this raises :class:`TemperatureOutOfBand` *before*
-        commanding the hardware if the heater is not within
-        ``temperature_tolerance_c`` of the setpoint. The check, the read
-        of actual/setpoint, and the driver call all happen under the
-        same lock so a concurrent ``set_sealing_temperature`` cannot
-        race the precondition.
+        Two layer-1 interlocks fire before the hardware moves:
+
+        1. **Stage** — raises :class:`StageNotLoaded` unless
+           ``components.stage.state == "in"``. Checked first because
+           a wrong-stage refusal is faster for the operator to fix
+           (a single click) than a temperature ramp.
+        2. **Temperature** — raises :class:`TemperatureOutOfBand` if
+           the heater is outside ``temperature_tolerance_c`` of the
+           setpoint.
+
+        Both pre-flight checks leave hardware state untouched, so
+        ``_stage_state`` is unchanged on either refusal path.
+
+        On the COM path: the cycle physically commits the stage to
+        ``"in"`` (the carriage is under the press at the start and
+        stays there at the end). We pessimize to ``"unknown"`` on
+        entry so a mid-cycle failure (driver fault after the
+        physical commit started) leaves a truthful state instead of
+        a stale ``"in"``.
         """
-        # Inlined (not via ``_do``) so the precondition check and the
+        # Inlined (not via ``_do``) so the precondition checks and the
         # ``StartCycle`` COM call sit inside a single critical section.
         async with self._lock:
             if self._driver is None or not self._driver_connected():
                 raise RuntimeError(
                     "PlateLoc is not connected. POST /control/startup first."
                 )
+            # Stage gate first (cheap; in-memory). Temperature gate
+            # second (requires async COM reads). allowed_actions is
+            # built from the same two helpers, so the surfaces agree.
+            self._assert_stage_loaded()
             await self._assert_temperature_in_band()
+            # Both pre-flights passed; from here on the COM call may
+            # mutate physical stage position. Pessimize.
+            self._stage_state = "unknown"
             try:
                 await asyncio.to_thread(self._driver.start_cycle)
             except Exception as exc:
                 detail = await self._read_driver_last_error()
                 self._record_error(exc, "start_cycle", detail=detail)
+                # Leave _stage_state as "unknown" — the cycle aborted
+                # mid-motion and the carriage position is no longer
+                # tracked.
                 raise
+            self._stage_state = "in"
         self._busy_state = True
 
     def evaluate_temperature_interlock(
@@ -437,6 +505,52 @@ class PlateLocService:
             "retry_after_s": retry_after_s,
         }
 
+    def evaluate_stage_interlock(
+        self,
+        stage_state: str,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Single source of truth for the stage-position interlock.
+
+        Returns ``(should_block, body_for_412)``:
+
+        * ``should_block`` is ``False`` when ``stage_state == "in"`` —
+          the stage is loaded and a seal cycle can proceed — or when
+          ``enforce_stage_interlock`` is disabled. In both cases
+          ``body_for_412`` is ``None``.
+        * ``should_block`` is ``True`` when ``stage_state`` is
+          ``"out"`` or ``"unknown"``. The returned ``body_for_412``
+          is the structured JSON body that ``/control/seal/start``
+          returns with HTTP 412. No ``Retry-After`` — recovery is
+          operator-driven (``POST /control/stage/in``), not
+          time-based.
+
+        Mirrors :meth:`evaluate_temperature_interlock` so the two
+        interlocks compose uniformly at the seal.start endpoint and
+        the /status allowed_actions builder.
+        """
+        if not self.enforce_stage_interlock:
+            return False, None
+        if stage_state == "in":
+            return False, None
+        return True, {
+            "detail": "Stage not loaded",
+            "stage_state": stage_state,
+            "required": "in",
+        }
+
+    def _assert_stage_loaded(self) -> None:
+        """Raise :class:`StageNotLoaded` if the stage interlock would
+        block a seal cycle right now.
+
+        Caller MUST already hold ``self._lock``. Synchronous because
+        stage state is in-memory — no driver I/O needed.
+        """
+        blocks, body = self.evaluate_stage_interlock(self._stage_state)
+        if not blocks:
+            return
+        assert body is not None  # invariant: blocks=True implies a body
+        raise StageNotLoaded(body["detail"], stage_state=body["stage_state"])
+
     async def _assert_temperature_in_band(self) -> None:
         """Raise :class:`TemperatureOutOfBand` if the temperature
         interlock would block a seal cycle right now.
@@ -469,10 +583,47 @@ class PlateLocService:
         self._busy_state = False
 
     async def move_stage_in(self) -> None:
-        await self._do("move_stage_in", lambda d: d.move_stage_in())
+        """Move the plate carriage to the loaded position.
+
+        Tracks ``_stage_state`` per the v1.3.0 transition table.
+        Inlined (not via :meth:`_do`) so the state mutations and the
+        COM call sit inside the same critical section.
+        """
+        await self._move_stage("move_stage_in", "in")
 
     async def move_stage_out(self) -> None:
-        await self._do("move_stage_out", lambda d: d.move_stage_out())
+        """Move the plate carriage to the unloaded position.
+
+        Tracks ``_stage_state`` per the v1.3.0 transition table.
+        """
+        await self._move_stage("move_stage_out", "out")
+
+    async def _move_stage(self, com_method: str, target: str) -> None:
+        """Shared implementation for ``move_stage_in`` and
+        ``move_stage_out``. Pessimizes ``_stage_state`` on entry and
+        commits to ``target`` only on a clean COM return.
+
+        A POST /control/stage/{in,out} to the position the stage is
+        already in is handled as a no-op 200 by the COM driver. The
+        net state remains ``target``; a /status poll mid-call cannot
+        observe the "unknown" flicker because /status takes the same
+        lock.
+        """
+        async with self._lock:
+            if self._driver is None or not self._driver_connected():
+                raise RuntimeError(
+                    "PlateLoc is not connected. POST /control/startup first."
+                )
+            self._stage_state = "unknown"
+            try:
+                await asyncio.to_thread(getattr(self._driver, com_method))
+            except Exception as exc:
+                detail = await self._read_driver_last_error()
+                self._record_error(exc, com_method, detail=detail)
+                # Leave _stage_state as "unknown" — the move failed
+                # mid-motion and we no longer know where the carriage is.
+                raise
+            self._stage_state = target
 
     async def _do(self, name: str, fn: Callable[[Any], Any]) -> None:
         async with self._lock:
@@ -648,6 +799,13 @@ class PlateLocService:
             heater_state = "cooling"
             heater_message = f"Cooling {actual_temp} -> {setpoint} C"
 
+        # Stage state is command-tracked (v1.3.0). On a disconnected
+        # driver we cannot vouch for the carriage so we override to
+        # "unknown" regardless of the last commanded position — the
+        # next /control/startup leaves it "unknown" until the operator
+        # explicitly homes.
+        stage_component_state = self._stage_state if connected else "unknown"
+
         components: dict[str, ComponentStatus] = {
             "sealer": ComponentStatus(
                 connected=connected,
@@ -662,9 +820,9 @@ class PlateLocService:
                 # not the poll timestamp. Wire that up when we have a
                 # transition tracker.
             ),
-            # The ActiveX control does not expose a stage position query,
-            # so we report it as `unknown` until events are wired in.
-            "stage": ComponentStatus(connected=connected, state="unknown"),
+            "stage": ComponentStatus(
+                connected=connected, state=stage_component_state
+            ),
         }
 
         # Tell readers what tolerance defines "stable" so a dashboard or
@@ -693,18 +851,32 @@ class PlateLocService:
             message = "Idle, ready to seal"
 
         # ---- allowed_actions ---------------------------------------------
-        # Start from the state-derived defaults, then drop seal.start when
-        # the temperature interlock would refuse it. This MUST consult
-        # the same helper as the /control/seal/start 412 path or
-        # workflow clients that trust allowed_actions verbatim will
-        # round-trip into a 412 they could have avoided.
+        # Start from the state-derived defaults, then layer the v1.2.1
+        # temperature interlock and the v1.3.0 stage interlock on top.
+        # Both gates consult the SAME helpers the /control/seal/start
+        # 412 path uses, so a workflow client trusting allowed_actions
+        # verbatim cannot round-trip into a 412 the device would have
+        # refused.
         allowed_actions = list(_ALLOWED_ACTIONS_BY_STATE.get(state, []))
-        if state in ("ready", "dry_run") and "seal.start" in allowed_actions:
-            blocks, _body = self.evaluate_temperature_interlock(
-                actual_f, setpoint_f
-            )
-            if blocks:
-                allowed_actions.remove("seal.start")
+        if state in ("ready", "dry_run"):
+            if "seal.start" in allowed_actions:
+                stage_blocks, _ = self.evaluate_stage_interlock(
+                    stage_component_state
+                )
+                temp_blocks, _ = self.evaluate_temperature_interlock(
+                    actual_f, setpoint_f
+                )
+                if stage_blocks or temp_blocks:
+                    allowed_actions.remove("seal.start")
+            # Stage move dedup: don't advertise the no-op direction.
+            # A POST to the "already there" direction is still accepted
+            # (the device treats it as a 200 no-op); we just leave it
+            # out of the advertised list so an operator UI doesn't show
+            # a redundant button.
+            if stage_component_state == "in" and "stage.in" in allowed_actions:
+                allowed_actions.remove("stage.in")
+            if stage_component_state == "out" and "stage.out" in allowed_actions:
+                allowed_actions.remove("stage.out")
 
         return EquipmentStatus(
             protocol_version=PROTOCOL_VERSION,
@@ -786,4 +958,9 @@ class PlateLocService:
             logger.exception("PlateLoc error in %s", code)
 
 
-__all__ = ["PlateLocService", "TemperatureOutOfBand", "_StubPlateLoc"]
+__all__ = [
+    "PlateLocService",
+    "StageNotLoaded",
+    "TemperatureOutOfBand",
+    "_StubPlateLoc",
+]

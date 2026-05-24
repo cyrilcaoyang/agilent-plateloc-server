@@ -1,5 +1,83 @@
 # Changelog
 
+## v1.3.0 — stage-position interlock
+
+The first behaviour change broader than v1.2.x's auto-clear / mirror:
+`/status.components.stage.state` is now meaningful (no longer a
+hardcoded `"unknown"`) and a layer-1 interlock refuses
+`/control/seal/start` when the carriage isn't loaded.
+
+### Stage interlock
+
+| | |
+|---|---|
+| **Rule** | `components.stage.state == "in"` |
+| **412 body** | `{"detail": "Stage not loaded", "stage_state": "out"\|"unknown", "required": "in"}` |
+| **`Retry-After`** | not set (recovery is operator-driven, not time-based) |
+| **Config flag** | `[service].enforce_stage_interlock` (default `true`); independent of `enforce_temp_interlock` |
+
+Same shape as the v1.2.1 temperature interlock: a single
+`PlateLocService.evaluate_stage_interlock(stage_state) ->
+(should_block, body)` helper feeds both the 412 path *and* the
+`/status.allowed_actions` builder. The two surfaces cannot drift.
+
+### Stage state is in-memory, command-tracked
+
+The Agilent COM API exposes no stage-position query
+(`MoveStageIn`/`MoveStageOut` only — no `GetStagePosition`). v1.3.0
+tracks position by remembering the last commanded direction:
+
+* Fresh process start → `"unknown"` (deliberate; an NSSM restart
+  cannot vouch for the carriage)
+* `POST /control/stage/in` returns 200 → `"in"`
+* `POST /control/stage/out` returns 200 → `"out"`
+* `POST /control/seal/start` returns 200 → `"in"` (cycle commits the
+  carriage)
+* `POST /control/seal/start` returns 412 pre-flight → unchanged
+  (refusal had no side effect)
+* `POST /control/seal/start` fails mid-cycle (5xx) → `"unknown"`
+* `POST /control/stage/*` 4xx/5xx → `"unknown"`
+* `POST /control/shutdown` returns 200 → `"unknown"` (next startup
+  must re-home)
+
+After any process restart the operator must `POST /control/stage/in`
+(or `out`) before the device will accept `seal.start`. The dashboard
+tile renders the disabled state by reading
+`/status.allowed_actions` — no extra client-side logic needed.
+
+### allowed_actions composition
+
+`/status.allowed_actions` now drops:
+
+* `seal.start` when EITHER the stage OR the temperature interlock
+  would refuse (412-path order: stage first, temperature second);
+* `stage.in` when `stage.state == "in"` (no-op direction);
+* `stage.out` when `stage.state == "out"` (no-op direction).
+
+A redundant stage move is still accepted as a 200 no-op on the wire
+— the dedup is purely advisory, to keep an operator UI from
+advertising a no-op button.
+
+### Compatibility
+
+* STATUS_SPEC v1.1 conformance preserved.
+* `412` body shape for the temperature interlock and the
+  `Retry-After` header are unchanged.
+* `enforce_temp_interlock` flag unchanged. `enforce_stage_interlock`
+  is new (default `true`).
+* Workflow code that already calls `/control/stage/in` before
+  `seal.start` needs no changes. Code that didn't will start seeing
+  412s with the new `Stage not loaded` body; the fix is to home the
+  carriage explicitly.
+
+### Source
+
+Prompt: "v1.3.0 — track and publish components.stage.state, gate
+seal.start on stage.state == 'in', mirror v1.2.1's
+single-helper-extraction pattern."
+
+---
+
 ## v1.2.1 — operational follow-ups on top of v1.2.0
 
 Two additive, schema-preserving fixes that close gaps the dashboard

@@ -115,6 +115,10 @@ _DEFAULTS: dict[str, Any] = {
         # /control/seal/start refuses with HTTP 412 if the heater is outside
         # +/- temperature_tolerance_c of the setpoint. Default true.
         "enforce_temp_interlock": True,
+        # Layer-1 stage interlock (v1.3.0). When true, /control/seal/start
+        # refuses with HTTP 412 if the stage is not in the loaded position.
+        # Independent of enforce_temp_interlock. Default true.
+        "enforce_stage_interlock": True,
     },
     # Identity reported in /status; should match the entry in the dashboard's
     # `equipment.yaml`. equipment_kind is fixed at "plate_sealer".

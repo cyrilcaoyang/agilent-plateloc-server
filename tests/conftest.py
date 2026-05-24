@@ -40,6 +40,13 @@ def client(unclaimed_client: TestClient) -> TestClient:
     and attaches ``X-Claim-Token`` to every request so existing v1.0-era
     test bodies continue to work unchanged.
 
+    v1.3.0 addition: this fixture also homes the stage to ``"in"`` so
+    legacy tests (seal-cycle round-trip, temperature interlock, etc.)
+    can issue ``/control/seal/start`` without bumping into the new
+    stage interlock. Tests that exercise the stage interlock itself
+    construct their own clients (see ``_build_claimed_client`` in
+    ``test_api.py``).
+
     Each test gets a fresh app/service - no shared state across tests.
     """
     r = unclaimed_client.post(
@@ -48,6 +55,7 @@ def client(unclaimed_client: TestClient) -> TestClient:
     )
     assert r.status_code == 200, r.text
     unclaimed_client.headers["X-Claim-Token"] = r.json()["claim_token"]
+    unclaimed_client.post("/control/stage/in")
     return unclaimed_client
 
 

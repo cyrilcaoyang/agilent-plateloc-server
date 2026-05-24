@@ -41,6 +41,15 @@ enforce_temp_interlock = true               # Layer-1 safety: refuse /control/se
                                             # > [film].temperature_tolerance_c. Leave
                                             # true in production; set false only for
                                             # emergency overrides (e.g. cold calibration).
+enforce_stage_interlock = true              # Layer-1 safety (v1.3.0): refuse
+                                            # /control/seal/start with HTTP 412 when
+                                            # the stage is not in the loaded position
+                                            # (components.stage.state != "in").
+                                            # Independent of enforce_temp_interlock.
+                                            # Stage position is command-tracked; on
+                                            # process restart it defaults to "unknown"
+                                            # and the operator must home it via
+                                            # /control/stage/{in,out} before sealing.
 
 # ── Dashboard identity ──────────────────────────────────────────────
 # Reported in GET /status. Must match the entry in the dashboard's

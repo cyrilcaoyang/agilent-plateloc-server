@@ -453,6 +453,47 @@ is advisory.
 > through the SDK or `curl` on the Tailnet would otherwise bypass the
 > tile check.
 
+#### Stage interlock — refuses `/control/seal/start` when the carriage isn't loaded (v1.3.0)
+
+| | |
+|---|---|
+| **Rule** | `components.stage.state == "in"` |
+| **HTTP response when violated** | `412 Precondition Failed` with a top-level JSON body. **No `Retry-After`** — recovery is operator-driven, not time-based. |
+| **Config flag** | `[service].enforce_stage_interlock` (default `true`). Independent of `enforce_temp_interlock`. |
+| **Override** | Set `enforce_stage_interlock = false` only for emergency overrides. Running with it off restores the failure mode where a seal cycle starts with the carriage extended — wasted hot air, risk of film damage, no actual seal. |
+
+Response body on a 412:
+
+```json
+{
+  "detail": "Stage not loaded",
+  "stage_state": "out",
+  "required": "in"
+}
+```
+
+`stage_state` is `"out"` or `"unknown"`. When BOTH the stage and temperature interlocks would refuse the call, the stage refusal lands first (faster for the operator to fix — one click vs. a temperature ramp). The temperature body is not surfaced in that case; resolve the stage first, then re-POST.
+
+**In-memory, command-tracked state.** The Agilent COM API exposes no stage-position query, so v1.3.0 tracks position by remembering the last commanded direction. The transitions are:
+
+| Trigger                                           | New state |
+|---------------------------------------------------|-----------|
+| Process startup (in-memory state initialised)     | `unknown` |
+| `POST /control/stage/in` returns 200              | `in`      |
+| `POST /control/stage/out` returns 200             | `out`     |
+| `POST /control/stage/{in,out}` returns 4xx / 5xx  | `unknown` |
+| `POST /control/seal/start` returns 200            | `in`      |
+| `POST /control/seal/start` returns 412 pre-flight | unchanged |
+| `POST /control/seal/start` fails mid-cycle (5xx)  | `unknown` |
+| `POST /control/shutdown` returns 200              | `unknown` |
+| Driver disconnect / error from COM                | `unknown` |
+
+> ⚠️ **State is in-memory only.** After an NSSM restart (or any process restart) the carriage position is `unknown` and the operator must explicitly `POST /control/stage/in` (or `out`) before the device will accept `/control/seal/start`. The contract is deliberate: the plate may have been moved manually while the service was down, so any persisted state would be a lie. The dashboard tile renders `seal.start` as disabled until the carriage is homed.
+
+**Stage move dedup.** When `stage.state == "in"`, `/status.allowed_actions` omits `stage.in` (no-op direction); same for `stage.out`. The `POST` itself is still accepted as a 200 no-op — the asymmetry vs. `seal.start` is intentional: a redundant stage move is harmless; sealing without a plate is wasted hot air.
+
+`v1.3.0` also extends the existing v1.2.1 pattern: both surfaces (`/status.allowed_actions` and the 412 path) consult the same `PlateLocService.evaluate_stage_interlock` helper, so a workflow client trusting `allowed_actions` verbatim cannot race into a 412 the device would have refused.
+
 #### `last_error` clears on the next successful operational action
 
 The structured `last_error` block on `/status` reports the most recent
@@ -519,8 +560,12 @@ agilent_plateloc/
     ├── test_claims.py           # v1.1 claim protocol conformance tests
     └── fixtures/
         ├── status_dry_run.json
-        ├── status_ready.json
+        ├── status_ready.json                    # stage homed in, seal.start present
         ├── status_ready_claimed.json
+        ├── status_ready_stage_unknown.json      # v1.3.0: after startup, before homing
+        ├── status_ready_stage_out.json          # v1.3.0: carriage extended
+        ├── status_ready_heating.json            # v1.2.1: temp gate blocks seal.start
+        ├── status_ready_mid_cycle_failure.json  # v1.3.0: last_error set, stage unknown
         ├── status_busy.json
         └── status_requires_init.json
 ```

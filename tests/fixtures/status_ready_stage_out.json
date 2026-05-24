@@ -4,14 +4,14 @@
     "shutdown",
     "seal.set_temperature",
     "seal.set_time",
-    "stage.out"
+    "stage.in"
   ],
   "components": {
     "heater": {
       "connected": true,
       "last_event_at": null,
-      "message": "Heating 80 -> 170 C",
-      "state": "heating"
+      "message": "At setpoint (170 C)",
+      "state": "stable"
     },
     "sealer": {
       "connected": true,
@@ -23,7 +23,7 @@
       "connected": true,
       "last_event_at": null,
       "message": null,
-      "state": "in"
+      "state": "out"
     }
   },
   "details": {
@@ -50,7 +50,7 @@
     "actual_temperature": {
       "timestamp": "2026-04-29T22:50:01Z",
       "unit": "C",
-      "value": 80
+      "value": 170
     },
     "cycle_count": {
       "timestamp": null,
@@ -70,7 +70,7 @@
     "temperature_delta_c": {
       "timestamp": "2026-04-29T22:50:01Z",
       "unit": "C",
-      "value": -90.0
+      "value": 0.0
     }
   },
   "protocol_version": "1.1",
