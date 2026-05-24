@@ -930,6 +930,297 @@ def test_two_surface_agreement_property() -> None:
             c.__exit__(None, None, None)
 
 
+# ---------------------------------------------------------------------------
+# v1.3.1 last_error.code taxonomy
+# ---------------------------------------------------------------------------
+
+
+def _install_failure(
+    driver,
+    *,
+    method: str,
+    exc: Exception,
+    driver_detail: str | None = None,
+) -> None:
+    """Replace ``driver.<method>`` with one that raises ``exc`` and
+    install a ``get_last_error`` returning ``driver_detail`` so the
+    classifier sees both the exception text and the driver-reported
+    text. The stub doesn't ship ``get_last_error`` by default;
+    installing one here makes the test mimic what the real Agilent
+    driver does."""
+
+    def _boom(*_a: object, **_kw: object) -> None:
+        raise exc
+
+    setattr(driver, method, _boom)
+    if driver_detail is not None:
+        driver.get_last_error = lambda: driver_detail
+
+
+def _build_client_with_broken_startup(
+    *,
+    connect_exc: Exception,
+    driver_detail: str | None = None,
+):
+    """Spin up a service whose driver-factory yields a stub whose
+    ``connect()`` raises. The TestClient lifespan auto-runs startup,
+    so by the time this returns ``last_error`` is already populated
+    and the service is in ``requires_init``."""
+    from agilent_plateloc.api import create_app
+    from agilent_plateloc.service import _StubPlateLoc
+
+    def make_bad_stub() -> _StubPlateLoc:
+        s = _StubPlateLoc()
+
+        def _bad_connect(profile: str | None = None) -> None:  # noqa: ARG001
+            raise connect_exc
+
+        s.connect = _bad_connect  # type: ignore[method-assign]
+        if driver_detail is not None:
+            s.get_last_error = lambda: driver_detail  # type: ignore[attr-defined]
+        return s
+
+    app = create_app(dry_run=False, enforce_claims=True)
+    app.state.service._driver_factory = make_bad_stub
+    c = TestClient(app)
+    c.__enter__()
+    return c
+
+
+def test_last_error_code_low_air_pressure() -> None:
+    """Real-world startup-cycle failure: COM error -2147221503 with the
+    driver reporting Low Air Pressure. Text match wins over context."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="start_cycle",
+            exc=OSError("StartCycle returned error code -2147221503"),
+            driver_detail="Low Air Pressure Error",
+        )
+        r = c.post("/control/seal/start", json={"temperature_c": 170, "seconds": 3.0})
+        assert r.status_code == 500
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "low_air_pressure"
+        assert "Low Air Pressure" in last_error["message"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_com_init_failed() -> None:
+    """startup() raises a generic transport-level error; the
+    classifier falls back to com_init_failed (the startup context)."""
+    c = _build_client_with_broken_startup(
+        connect_exc=OSError("Initialize failed: No response from PlateLoc"),
+    )
+    try:
+        body = c.get("/status").json()
+        assert body["equipment_status"] == "requires_init"
+        assert body["last_error"]["code"] == "com_init_failed"
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_profile_not_found() -> None:
+    """startup() with a bad profile: the PlateLoc driver wraps the
+    Initialize() failure with the available profile list in the
+    exception text. The classifier picks that up over com_init_failed."""
+    c = _build_client_with_broken_startup(
+        connect_exc=Exception(
+            "Initialize('badprof') failed (code -2147221503). "
+            "Profile 'badprof' not found. "
+            "Available profiles: ['default']"
+        ),
+    )
+    try:
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "profile_not_found"
+        assert "badprof" in last_error["message"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_com_timeout() -> None:
+    """TimeoutError → com_timeout regardless of method context."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="stop_cycle",
+            exc=TimeoutError("driver call timed out after 5s"),
+        )
+        r = c.post("/control/seal/stop")
+        assert r.status_code == 500
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "com_timeout"
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_com_other() -> None:
+    """A driver error we don't yet classify falls through to com_other.
+    Falling here for a repeated failure mode is the signal to add a
+    new code to the taxonomy, not to grow the catch-all."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="set_sealing_temperature",
+            exc=OSError("Some unclassified driver fault"),
+        )
+        c.post("/control/seal/temperature", json={"temperature_c": 170})
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "com_other"
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_heater_overtemp() -> None:
+    """Driver detail mentioning over-temperature → heater_overtemp."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="start_cycle",
+            exc=OSError("StartCycle aborted"),
+            driver_detail="Heater overtemperature fault — exceeded safety limit",
+        )
+        c.post("/control/seal/start", json={"temperature_c": 170, "seconds": 3.0})
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "heater_overtemp"
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_heater_undertemp() -> None:
+    """Driver detail mentioning failure to reach setpoint →
+    heater_undertemp."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="start_cycle",
+            exc=OSError("StartCycle aborted"),
+            driver_detail="Heater did not reach setpoint within timeout window",
+        )
+        c.post("/control/seal/start", json={"temperature_c": 170, "seconds": 3.0})
+        last_error = c.get("/status").json()["last_error"]
+        # "did not reach setpoint" wins despite the word "timeout"
+        # appearing — classifier orders heater checks before com_timeout.
+        assert last_error["code"] == "heater_undertemp"
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_stage_jam() -> None:
+    """A stage move failing without specific cause text → stage_jam
+    (context fallback for move_stage_* methods)."""
+    c, driver = _build_claimed_client(
+        enforce_temp_interlock=True, home_stage=False
+    )
+    try:
+        _install_failure(
+            driver,
+            method="move_stage_in",
+            exc=OSError("MoveStageIn returned -1"),
+            driver_detail="Stage cannot move — press is down",
+        )
+        c.post("/control/stage/in")
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "stage_jam"
+        # Driver text is preserved verbatim in the message.
+        assert "press is down" in last_error["message"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_process_internal() -> None:
+    """A KeyError (or similar Python type error) → process_internal,
+    flagging "software bug, file it" rather than "open diagnostics
+    dialog"."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="move_stage_out",
+            exc=KeyError("missing internal key"),
+        )
+        c.post("/control/stage/out")
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "process_internal"
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_message_preserves_driver_detail() -> None:
+    """Across every code, `last_error.message` carries the driver's
+    raw text. Codes classify; messages preserve fidelity."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="start_cycle",
+            exc=OSError("StartCycle returned -2147221503"),
+            driver_detail="Low Air Pressure Error",
+        )
+        c.post("/control/seal/start", json={"temperature_c": 170, "seconds": 3.0})
+        last_error = c.get("/status").json()["last_error"]
+        # Both the exception text AND the driver detail are visible.
+        assert "-2147221503" in last_error["message"]
+        assert "Low Air Pressure" in last_error["message"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_set_last_error_rejects_codes_outside_taxonomy() -> None:
+    """A developer who tries to set an unknown code gets a ValueError
+    immediately — the closed enum is enforced at the chokepoint."""
+    import pytest as _pytest
+
+    from agilent_plateloc.service import PlateLocService
+
+    s = PlateLocService(dry_run=True)
+    # All declared codes must be accepted.
+    from agilent_plateloc.service import LAST_ERROR_CODES
+
+    for code in LAST_ERROR_CODES:
+        s.set_last_error(code=code, message="example", severity="error")
+        assert s._last_error is not None
+        assert s._last_error.code == code
+
+    # An undeclared value must be rejected.
+    with _pytest.raises(ValueError):
+        s.set_last_error(
+            code="not_a_real_code", message="x", severity="error"
+        )
+
+
+def test_last_error_code_clears_with_message() -> None:
+    """v1.2.1 auto-clear: on the first 2xx operational response after
+    a failure, the entire last_error (code + message + severity +
+    timestamp) clears together — no partial state."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="move_stage_out",
+            exc=OSError("transient fault"),
+            driver_detail="Low Air Pressure Error",
+        )
+        c.post("/control/stage/out")
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "low_air_pressure"
+
+        # Restore the method by removing the instance attribute —
+        # access then falls back to the class-level method.
+        del driver.move_stage_out
+        r = c.post("/control/stage/in")
+        assert r.status_code == 200
+        assert c.get("/status").json()["last_error"] is None
+    finally:
+        c.__exit__(None, None, None)
+
+
 def test_shutdown_then_control_returns_409(client: TestClient) -> None:
     """Spec-friendly behaviour: control endpoints fail with 409 (not 500)
     when the driver isn't connected, so the operator UI can render a
@@ -984,6 +1275,7 @@ def test_save_status_fixtures(unclaimed_client: TestClient) -> None:
       - status_ready_stage_out.json        - ready with stage out, seal.start ABSENT (v1.3.0)
       - status_ready_heating.json          - heater below band, seal.start ABSENT
       - status_ready_mid_cycle_failure.json - last_error populated, stage unknown (v1.3.0)
+      - status_last_error_low_air_pressure.json - real-world taxonomy example (v1.3.1)
       - status_busy.json                   - cycle in progress (uses stub driver)
       - status_dry_run.json                - dry-run mode advertised in /status
     """
@@ -1119,6 +1411,40 @@ def test_save_status_fixtures(unclaimed_client: TestClient) -> None:
         assert body["components"]["stage"]["state"] == "unknown"
         assert body["last_error"] is not None
         (FIXTURES / "status_ready_mid_cycle_failure.json").write_text(
+            json.dumps(_scrub_for_diff(body), indent=2, sort_keys=True) + "\n"
+        )
+
+        # v1.3.1: real-world taxonomy example. Drive a low-air-pressure
+        # failure path so the dashboard repo has a canonical reference
+        # snapshot of the new last_error.code field on the wire.
+        alt.post("/control/stage/in")
+        heating_driver._set_temp = 170
+        heating_driver._actual_temp = 170
+        heating_driver.get_last_error = lambda: "Low Air Pressure Error"
+
+        def _air(*_a: object, **_kw: object) -> None:
+            raise OSError(
+                "StartCycle returned error code -2147221503. "
+                "Call get_last_error() for details."
+            )
+
+        original_start = heating_driver.start_cycle
+        heating_driver.start_cycle = _air
+        r = alt.post(
+            "/control/seal/start",
+            json={"temperature_c": 170, "seconds": 3.0},
+        )
+        assert r.status_code == 500
+        heating_driver.start_cycle = original_start
+        # Restore stub's get_last_error (the stub doesn't ship one,
+        # so just delete the instance attribute).
+        try:
+            del heating_driver.get_last_error
+        except AttributeError:
+            pass
+        body = alt.get("/status").json()
+        assert body["last_error"]["code"] == "low_air_pressure"
+        (FIXTURES / "status_last_error_low_air_pressure.json").write_text(
             json.dumps(_scrub_for_diff(body), indent=2, sort_keys=True) + "\n"
         )
 

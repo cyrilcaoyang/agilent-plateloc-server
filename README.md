@@ -526,6 +526,41 @@ in the endpoint has succeeded but *before* the response body is built,
 so a multi-step endpoint (e.g. `seal/start` setting time then refusing
 on the band check) does not partially clear.
 
+#### `last_error.code` taxonomy (v1.3.1)
+
+`last_error.code` was a free-form string through v1.3.0 (typically the
+failing method name). `v1.3.1` promotes it to a **closed enum** so
+dashboards branch on `code` and never have to regex-match on
+`message`. The wire shape is unchanged (`ErrorInfo.code` is still
+`str | None`); the contract is internal validation — `set_last_error`
+rejects any value outside the table.
+
+| `code`              | When it fires                                                                                                 | Dashboard recovery hint                          |
+|---------------------|---------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
+| `low_air_pressure`  | Driver returns "Low Air Pressure" — the lab air supply dropped below the press requirement.                  | "Check air supply / regulator pressure."         |
+| `com_init_failed`   | Startup couldn't reach the physical sealer (e.g. powered off, serial cable disconnected, COM port busy).      | "Check power and serial cable; restart device."  |
+| `com_timeout`       | A COM call timed out without a specific driver error code.                                                    | "Driver unresponsive — restart device service."  |
+| `com_other`         | Catch-all for driver errors we don't yet classify. A repeated failure landing here is the cue to add a code. | "Unhandled driver fault — file a bug."           |
+| `heater_overtemp`   | Driver reports the heater exceeded its safety limit.                                                          | "Heater overtemperature — service required."     |
+| `heater_undertemp`  | Heater failed to reach setpoint after the expected ramp window.                                              | "Heater not reaching setpoint — service required."|
+| `profile_not_found` | `Initialize()` was called with a profile name not configured in the Diagnostics dialog.                       | "Open Diagnostics dialog and create profile."    |
+| `stage_jam`         | A stage move command failed in a way that wasn't simply "stage didn't move" (e.g. driver reports the press is down). | "Check carriage path; recover via Diagnostics."  |
+| `process_internal`  | A Python type error (KeyError, AttributeError, etc.) bubbled up — software bug, not a driver fault.          | "Service bug — file an issue."                   |
+
+The classifier (`PlateLocService._classify_error`) inspects the
+failing method name, the exception, and the driver's
+`get_last_error()` detail string, in that order of specificity:
+Python type errors first (`process_internal`), then text-based driver
+matches (`low_air_pressure`, `heater_*`), then `com_timeout`, then
+context fallbacks (`stage_jam` for stage moves, `com_init_failed` for
+startup), then `com_other` as the default.
+
+The `message` field still carries the driver's free-form text
+verbatim — codes classify, messages preserve fidelity. Auto-clear
+(see above) drops the entire `last_error` block together, so a
+dashboard never sees a partial state where `code` and `message`
+disagree.
+
 ### Running on the device PC
 
 The PlateLoc PC is a Windows machine on the lab Tailnet. Recommended
@@ -566,6 +601,7 @@ agilent_plateloc/
         ├── status_ready_stage_out.json          # v1.3.0: carriage extended
         ├── status_ready_heating.json            # v1.2.1: temp gate blocks seal.start
         ├── status_ready_mid_cycle_failure.json  # v1.3.0: last_error set, stage unknown
+        ├── status_last_error_low_air_pressure.json  # v1.3.1: taxonomy wire example
         ├── status_busy.json
         └── status_requires_init.json
 ```

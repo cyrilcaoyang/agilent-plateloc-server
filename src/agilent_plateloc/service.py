@@ -180,6 +180,103 @@ class _StubPlateLoc:
 _RECENT_ERROR_WINDOW_S = 60.0  # how long an error keeps the device in `error`
 
 
+# ---------------------------------------------------------------------------
+# last_error.code taxonomy (v1.3.1)
+#
+# A closed set of identifiers for *what* failed, separate from `message`
+# (the driver's free-form text). The dashboard renders a targeted
+# recovery hint by branching on `code`; it MUST NOT regex on `message`.
+#
+# `_classify_error` is the single classifier: given the failing method
+# name, the exception, and the driver's `get_last_error()` detail, it
+# returns one of these codes. Order in the classifier matters — text
+# matches (low_air_pressure, heater_*) win over context fallbacks
+# (stage_jam, com_init_failed) so a specific cause beats "the stage
+# move endpoint failed for some reason".
+#
+# Keep this list minimal. Add a code only when the codebase actually
+# raises that mode AND the dashboard would render differently for it.
+# "com_other" is the catch-all; falling into it on a previously-seen
+# failure mode is the signal to add a new code, not to grow this comment.
+# ---------------------------------------------------------------------------
+
+LAST_ERROR_CODES: frozenset[str] = frozenset(
+    {
+        "low_air_pressure",
+        "com_init_failed",
+        "com_timeout",
+        "com_other",
+        "heater_overtemp",
+        "heater_undertemp",
+        "profile_not_found",
+        "stage_jam",
+        "process_internal",
+    }
+)
+
+
+def _classify_error(
+    method_name: str, exc: Exception, detail: str | None
+) -> str:
+    """Return one of ``LAST_ERROR_CODES`` for the given failure.
+
+    Order is deliberate:
+
+    1. ``process_internal`` — Python type errors (KeyError, etc.)
+       indicate a software bug, not a driver fault. Distinguishing
+       these is the dashboard's signal to file a ticket rather than
+       reach for the diagnostics dialog.
+    2. Specific text matches — ``low_air_pressure``, ``heater_*``,
+       ``profile_not_found``. Driver text is the most reliable signal.
+    3. ``com_timeout`` — timeout substring beats generic com_other.
+    4. Context fallbacks — ``stage_jam`` if the failing method was a
+       stage move; ``com_init_failed`` if the failing method was
+       startup. These fire when the driver text is unhelpful (empty
+       or generic HRESULT).
+    5. ``com_other`` — default; anything we don't yet classify.
+    """
+    if isinstance(exc, (KeyError, AttributeError, TypeError, NameError)):
+        return "process_internal"
+
+    detail_text = (detail or "").lower()
+    exc_text = str(exc).lower()
+    haystack = f"{detail_text} {exc_text}"
+
+    # Profile mis-config: only meaningful at startup time. The
+    # PlateLoc driver wraps Initialize() failures with the available
+    # profile list in the exception text — match on that, not on the
+    # generic HRESULT.
+    if method_name == "startup" and (
+        "profile" in haystack
+        and ("not found" in haystack or "available profiles" in haystack)
+    ):
+        return "profile_not_found"
+
+    # Driver-text matches — most specific signals.
+    if "air pressure" in haystack:
+        return "low_air_pressure"
+    if "overtemp" in haystack or "over temp" in haystack or "over-temperature" in haystack:
+        return "heater_overtemp"
+    if (
+        "undertemp" in haystack
+        or "under temp" in haystack
+        or "did not reach setpoint" in haystack
+    ):
+        return "heater_undertemp"
+
+    # Timeouts: TimeoutError type OR "timeout"/"timed out" substring.
+    if isinstance(exc, TimeoutError) or "timeout" in haystack or "timed out" in haystack:
+        return "com_timeout"
+
+    # Context fallbacks — used when the text alone isn't decisive.
+    if method_name in ("move_stage_in", "move_stage_out"):
+        return "stage_jam"
+    if method_name == "startup":
+        return "com_init_failed"
+
+    return "com_other"
+
+
 class TemperatureOutOfBand(Exception):
     """Raised by ``start_cycle`` when the heater is not at setpoint.
 
@@ -938,27 +1035,71 @@ class PlateLocService:
         self._last_error = None
 
     def _record_error(
-        self, exc: Exception, code: str, *, detail: str | None = None
+        self, exc: Exception, method_name: str, *, detail: str | None = None
     ) -> None:
+        """Capture a driver / service failure into ``self._last_error``.
+
+        ``method_name`` is the failing service method (``"startup"``,
+        ``"start_cycle"``, ``"move_stage_in"``, etc.) — used by the
+        classifier as a *context* fallback when the driver text alone
+        isn't decisive. The persisted ``code`` is the
+        :data:`LAST_ERROR_CODES` value, not the method name.
+        """
         message = str(exc)
         if detail and detail not in message:
             # The driver-reported text is what makes 0x80040201 actionable
             # ("Could not initialize - No response from PlateLoc",
             # "Stage cannot move - press is down", etc.). Append it once.
             message = f"{message} (driver: {detail})"
+        code = _classify_error(method_name, exc, detail)
+        self.set_last_error(code=code, message=message, severity="error")
+        if detail:
+            logger.exception(
+                "PlateLoc error in %s (code=%s, driver: %s)",
+                method_name,
+                code,
+                detail,
+            )
+        else:
+            logger.exception(
+                "PlateLoc error in %s (code=%s)", method_name, code
+            )
+
+    def set_last_error(
+        self,
+        *,
+        code: str,
+        message: str,
+        severity: str = "error",
+    ) -> None:
+        """Single chokepoint for mutating ``self._last_error``.
+
+        Enforces that ``code`` is one of :data:`LAST_ERROR_CODES` so
+        callers can't accidentally introduce a free-form value that
+        dashboards would then have to start string-matching on.
+        Falling out of the enum is a developer error (raise immediately)
+        — not a runtime condition we recover from.
+
+        Use ``"com_other"`` as the explicit catch-all if you genuinely
+        have no better classification; that is the signal to add a new
+        code if the same failure mode shows up repeatedly.
+        """
+        if code not in LAST_ERROR_CODES:
+            raise ValueError(
+                f"last_error code {code!r} is not in LAST_ERROR_CODES. "
+                f"Add it to the taxonomy or use 'com_other' as the "
+                f"catch-all."
+            )
         self._last_error = ErrorInfo(
             code=code,
             message=message,
-            severity="error",
+            severity=severity,
             timestamp=datetime.now(timezone.utc),
         )
-        if detail:
-            logger.exception("PlateLoc error in %s (driver: %s)", code, detail)
-        else:
-            logger.exception("PlateLoc error in %s", code)
 
 
 __all__ = [
+    "LAST_ERROR_CODES",
     "PlateLocService",
     "StageNotLoaded",
     "TemperatureOutOfBand",

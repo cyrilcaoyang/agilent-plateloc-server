@@ -1,5 +1,79 @@
 # Changelog
 
+## v1.3.1 — structured `last_error.code` taxonomy
+
+`last_error.code` was a free-form string through v1.3.0 (typically
+the failing method name). v1.3.1 promotes it to a closed enum, so
+the dashboard branches on `code` and renders a targeted recovery
+hint instead of regex-matching on the driver's free-form
+`message`.
+
+### The taxonomy
+
+`LAST_ERROR_CODES` (in `agilent_plateloc.service`):
+
+* `low_air_pressure` — lab air supply dropped below the press
+  requirement
+* `com_init_failed` — startup couldn't reach the physical sealer
+  (powered off, cable disconnected, COM port busy)
+* `com_timeout` — a COM call timed out without a specific driver
+  error code
+* `com_other` — catch-all for driver errors we don't yet classify
+* `heater_overtemp` — exceeded safety limit
+* `heater_undertemp` — failed to reach setpoint within the ramp
+  window
+* `profile_not_found` — Initialize() called with a profile name not
+  configured in the Diagnostics dialog
+* `stage_jam` — stage move failed in a way that wasn't simply
+  "stage didn't move" (e.g. driver reports the press is down)
+* `process_internal` — a Python type error (KeyError, etc.) bubbled
+  up — software bug, not a driver fault
+
+### How classification works
+
+`PlateLocService._classify_error(method_name, exc, detail)` returns
+the code. Order is deliberate:
+
+1. Python type errors (`process_internal`) — software bugs are
+   distinguished from driver faults so the dashboard files a
+   ticket rather than reaching for the Diagnostics dialog.
+2. Specific text matches (`low_air_pressure`, `heater_*`,
+   `profile_not_found`) — driver text is the most reliable signal.
+3. `com_timeout` — TimeoutError type or "timeout"/"timed out"
+   substring.
+4. Context fallbacks (`stage_jam` for stage moves,
+   `com_init_failed` for startup) — fire when the driver text is
+   unhelpful.
+5. `com_other` — default. Falling here for a repeated failure mode
+   is the cue to add a code, not to grow the catch-all.
+
+### Single chokepoint
+
+A new internal helper `PlateLocService.set_last_error(code=...,
+message=..., severity=...)` rejects any code outside the enum with
+a `ValueError`. The existing `_record_error` was the only mutation
+site already, and it now routes through the helper. A developer
+who introduces an unclassified code gets an immediate failure, not
+a free-form string on the wire.
+
+### Compatibility
+
+* `ErrorInfo.code` is still typed `str | None` in the
+  STATUS_SPEC envelope — the wire shape is unchanged. Clients that
+  ignore `code` continue to work; clients that branch on it now
+  see consistently populated taxonomy values.
+* `message` still carries the driver's raw text verbatim.
+* The v1.2.1 auto-clear contract is unchanged: the entire
+  `last_error` (code + message + severity + timestamp) clears
+  together on the first 2xx operational action.
+
+### Source
+
+Prompt: "v1.3.1 — add structured last_error.code taxonomy
+mirroring the 412-by-code pattern at the precondition layer."
+
+---
+
 ## v1.3.0 — stage-position interlock
 
 The first behaviour change broader than v1.2.x's auto-clear / mirror:

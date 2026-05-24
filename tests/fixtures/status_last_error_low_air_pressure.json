@@ -41,12 +41,12 @@
   "equipment_version": null,
   "host": "plateloc-pc",
   "last_error": {
-    "code": "com_other",
-    "message": "Simulated mid-cycle COM fault",
+    "code": "low_air_pressure",
+    "message": "StartCycle returned error code -2147221503. Call get_last_error() for details. (driver: Low Air Pressure Error)",
     "severity": "error",
     "timestamp": "2026-04-29T22:50:01Z"
   },
-  "message": "Simulated mid-cycle COM fault",
+  "message": "StartCycle returned error code -2147221503. Call get_last_error() for details. (driver: Low Air Pressure Error)",
   "metrics": {
     "actual_temperature": {
       "timestamp": "2026-04-29T22:50:01Z",

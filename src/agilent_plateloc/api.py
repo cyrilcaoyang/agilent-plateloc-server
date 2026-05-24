@@ -209,7 +209,7 @@ def create_app(
 
     app = FastAPI(
         title="Agilent PlateLoc Sealer API",
-        version="1.3.0",
+        version="1.3.1",
         description=(
             "REST API for the Agilent PlateLoc Thermal Microplate Sealer. "
             "Conforms to the AC lab equipment status spec v1.1 - see the "
