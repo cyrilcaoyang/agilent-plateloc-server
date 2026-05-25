@@ -10,7 +10,7 @@ hint instead of regex-matching on the driver's free-form
 
 ### The taxonomy
 
-`LAST_ERROR_CODES` (in `agilent_plateloc.service`):
+`LAST_ERROR_CODES` (in `agilent_plateloc_server.service`):
 
 * `low_air_pressure` — lab air supply dropped below the press
   requirement

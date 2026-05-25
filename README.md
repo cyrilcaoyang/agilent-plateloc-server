@@ -21,7 +21,7 @@ Python driver and REST API service for the **Agilent PlateLoc Thermal Microplate
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 
 # Clone / navigate to the project
-cd path\to\agilent_plateloc
+cd path\to\agilent-plateloc-server
 
 # Copy the example config and edit for your setup
 copy config.example.toml config.toml
@@ -96,14 +96,14 @@ New-Item -ItemType Directory -Force C:\Users\sdl2\Projects | Out-Null
 New-Item -ItemType Directory -Force C:\SDL_Logs            | Out-Null
 
 cd C:\Users\sdl2\Projects
-git clone https://github.com/cyrilcaoyang/agilent_plateloc.git
-cd C:\Users\sdl2\Projects\agilent_plateloc
+git clone https://github.com/cyrilcaoyang/agilent-plateloc-server.git
+cd C:\Users\sdl2\Projects\agilent-plateloc-server
 copy config.example.toml config.toml ; notepad config.toml
 C:\SDL_Tools\uv.exe sync --extra api
 
 nssm install plateloc C:\SDL_Tools\uv.exe `
-    run --project C:\Users\sdl2\Projects\agilent_plateloc --extra api agilent-plateloc-serve
-nssm set plateloc AppDirectory  C:\Users\sdl2\Projects\agilent_plateloc
+    run --project C:\Users\sdl2\Projects\agilent-plateloc-server --extra api agilent-plateloc-serve
+nssm set plateloc AppDirectory  C:\Users\sdl2\Projects\agilent-plateloc-server
 nssm set plateloc AppStdout     C:\SDL_Logs\plateloc.out.log
 nssm set plateloc AppStderr     C:\SDL_Logs\plateloc.err.log
 nssm set plateloc AppExit Default Restart
@@ -155,9 +155,9 @@ You **must run as Administrator** the first time to create / edit a profile.
 #   • Press Win+X → select "Windows Terminal (Admin)" or "PowerShell (Admin)"
 #   • Or: press Win, type "powershell", right-click → "Run as administrator"
 
-cd path\to\agilent_plateloc
+cd path\to\agilent-plateloc-server
 .venv\Scripts\python.exe -c "
-from agilent_plateloc import PlateLoc
+from agilent_plateloc_server import PlateLoc
 s = PlateLoc()          # uses com_port from config.toml
 s._create_com_object()
 s.show_diags_dialog(modal=True, security_level=0)
@@ -182,7 +182,7 @@ In the Diagnostics dialog:
 After a profile exists:
 
 ```python
-from agilent_plateloc import PlateLoc
+from agilent_plateloc_server import PlateLoc
 
 with PlateLoc() as sealer:           # reads com_port from config.toml
     sealer.connect()                  # reads profile from config.toml
@@ -266,10 +266,10 @@ pip install -e ".[api]"           # adds fastapi + uvicorn + pydantic
 agilent-plateloc-serve
 
 # Or as a module (handy when iterating)
-python -m agilent_plateloc
+python -m agilent_plateloc_server
 
 # Force dry-run (no hardware) for development on macOS/Linux
-python -m agilent_plateloc --dry-run --port 8000
+python -m agilent_plateloc_server --dry-run --port 8000
 ```
 
 Configure host/port/dry-run in `config.toml`:
@@ -572,16 +572,16 @@ On Linux for CI/dev, a `systemd` unit pointing at
 ## Project Structure
 
 ```
-agilent_plateloc/
+agilent-plateloc-server/
 ├── README.md
 ├── pyproject.toml
 ├── config.example.toml          # Template — copy to config.toml
 ├── config.toml                  # Your local settings (gitignored)
 ├── demo.py                      # Demonstration script
 ├── src/
-│   └── agilent_plateloc/
+│   └── agilent_plateloc_server/
 │       ├── __init__.py          # Package entry point
-│       ├── __main__.py          # CLI: `python -m agilent_plateloc`
+│       ├── __main__.py          # CLI: `python -m agilent_plateloc_server`
 │       ├── plateloc.py          # Main driver class (ActiveX/COM)
 │       ├── _com_server.py       # 32-bit COM surrogate (internal)
 │       ├── config.py            # Config loader (reads config.toml)

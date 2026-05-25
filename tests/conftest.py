@@ -19,7 +19,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from agilent_plateloc.api import create_app
+from agilent_plateloc_server.api import create_app
 
 
 @pytest.fixture

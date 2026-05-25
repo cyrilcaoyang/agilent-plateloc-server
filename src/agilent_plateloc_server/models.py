@@ -11,7 +11,7 @@ package is published; once it is, replace this file with::
         ClaimRequest, ClaimResponse, ClaimRejection, ClaimedBy, ...
     )
 
-Conformance: agilent_plateloc REST API conforms to lab status spec v1.1.
+Conformance: agilent_plateloc_server REST API conforms to lab status spec v1.1.
 """
 
 from __future__ import annotations

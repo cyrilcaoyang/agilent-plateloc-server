@@ -12,9 +12,9 @@ Usage:
 import logging
 import time
 
-from agilent_plateloc import PlateLoc
-from agilent_plateloc.plateloc import PlateLocError
-from agilent_plateloc.config import (
+from agilent_plateloc_server import PlateLoc
+from agilent_plateloc_server.plateloc import PlateLocError
+from agilent_plateloc_server.config import (
     get as cfg,
     get_seal_parameters,
     load_parameters,

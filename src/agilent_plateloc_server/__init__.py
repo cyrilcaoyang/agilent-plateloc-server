@@ -12,7 +12,7 @@ type library CLSID, sealing defaults) are read from ``config.toml``.
 
 Usage::
 
-    from agilent_plateloc import PlateLoc
+    from agilent_plateloc_server import PlateLoc
 
     sealer = PlateLoc()                   # reads com_port from config.toml
     sealer.connect()                      # reads profile from config.toml
@@ -28,10 +28,10 @@ from .plateloc import PlateLoc
 __all__ = ["PlateLoc"]
 __version__ = "1.3.1"
 
-# The service / FastAPI app live in `agilent_plateloc.service` and
-# `agilent_plateloc.api` and are imported on demand to avoid pulling in
+# The service / FastAPI app live in `agilent_plateloc_server.service` and
+# `agilent_plateloc_server.api` and are imported on demand to avoid pulling in
 # FastAPI/uvicorn for callers that only want the driver. Import them
 # explicitly when needed::
 #
-#     from agilent_plateloc.api import create_app
-#     from agilent_plateloc.service import PlateLocService
+#     from agilent_plateloc_server.api import create_app
+#     from agilent_plateloc_server.service import PlateLocService

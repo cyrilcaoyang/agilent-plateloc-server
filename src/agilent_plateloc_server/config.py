@@ -98,7 +98,7 @@ _DEFAULTS: dict[str, Any] = {
         "typelib_major": 1,
         "typelib_minor": 0,
     },
-    # REST API service (`python -m agilent_plateloc`)
+    # REST API service (`python -m agilent_plateloc_server`)
     "service": {
         "host": "0.0.0.0",
         "port": 8000,

@@ -21,7 +21,7 @@ temperature_tolerance_c = 2
 heat_timeout_s = 120
 
 # ── REST API service ────────────────────────────────────────────────
-# Used by `python -m agilent_plateloc` / `agilent-plateloc-serve`.
+# Used by `python -m agilent_plateloc_server` / `agilent-plateloc-serve`.
 # The API conforms to the lab equipment status spec v1.1 (see the
 # ac-organic-lab monorepo's docs/STATUS_SPEC.md and STATUS_SPEC_v1_1.md).
 [service]

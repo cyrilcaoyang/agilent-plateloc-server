@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agilent-plateloc"
+name = "agilent-plateloc-server"
 version = "1.3.1"
 description = "Python driver and REST API for the Agilent PlateLoc Thermal Microplate Sealer (lab status spec v1.1)"
 readme = "README.md"
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [project.scripts]
-agilent-plateloc-serve = "agilent_plateloc.__main__:main"
+agilent-plateloc-serve = "agilent_plateloc_server.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

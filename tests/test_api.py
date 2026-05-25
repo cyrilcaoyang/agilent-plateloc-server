@@ -17,7 +17,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from agilent_plateloc.models import PROTOCOL_VERSION
+from agilent_plateloc_server.models import PROTOCOL_VERSION
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -171,8 +171,8 @@ def test_allowed_actions_ready_state() -> None:
     v1.3.0: after homing the stage to ``"in"``, ``stage.in`` is
     dedup'd out of allowed_actions because it would be a no-op.
     """
-    from agilent_plateloc.api import create_app
-    from agilent_plateloc.service import _StubPlateLoc
+    from agilent_plateloc_server.api import create_app
+    from agilent_plateloc_server.service import _StubPlateLoc
 
     app = create_app(dry_run=False, enforce_claims=True)
     app.state.service._driver_factory = _StubPlateLoc
@@ -200,8 +200,8 @@ def test_allowed_actions_ready_state() -> None:
 def test_allowed_actions_busy_state() -> None:
     """busy advertises seal.stop and shutdown (and nothing that would
     conflict with an in-flight cycle)."""
-    from agilent_plateloc.api import create_app
-    from agilent_plateloc.service import _StubPlateLoc
+    from agilent_plateloc_server.api import create_app
+    from agilent_plateloc_server.service import _StubPlateLoc
 
     app = create_app(dry_run=False, enforce_claims=True)
     app.state.service._driver_factory = _StubPlateLoc
@@ -289,8 +289,8 @@ def _build_claimed_client(
         interlock. Tests of the stage interlock itself pass
         ``home_stage=False`` so they can drive the carriage explicitly.
     """
-    from agilent_plateloc.api import create_app
-    from agilent_plateloc.service import _StubPlateLoc
+    from agilent_plateloc_server.api import create_app
+    from agilent_plateloc_server.service import _StubPlateLoc
 
     app = create_app(
         dry_run=False,
@@ -966,8 +966,8 @@ def _build_client_with_broken_startup(
     ``connect()`` raises. The TestClient lifespan auto-runs startup,
     so by the time this returns ``last_error`` is already populated
     and the service is in ``requires_init``."""
-    from agilent_plateloc.api import create_app
-    from agilent_plateloc.service import _StubPlateLoc
+    from agilent_plateloc_server.api import create_app
+    from agilent_plateloc_server.service import _StubPlateLoc
 
     def make_bad_stub() -> _StubPlateLoc:
         s = _StubPlateLoc()
@@ -1177,11 +1177,11 @@ def test_set_last_error_rejects_codes_outside_taxonomy() -> None:
     immediately — the closed enum is enforced at the chokepoint."""
     import pytest as _pytest
 
-    from agilent_plateloc.service import PlateLocService
+    from agilent_plateloc_server.service import PlateLocService
 
     s = PlateLocService(dry_run=True)
     # All declared codes must be accepted.
-    from agilent_plateloc.service import LAST_ERROR_CODES
+    from agilent_plateloc_server.service import LAST_ERROR_CODES
 
     for code in LAST_ERROR_CODES:
         s.set_last_error(code=code, message="example", severity="error")
@@ -1279,8 +1279,8 @@ def test_save_status_fixtures(unclaimed_client: TestClient) -> None:
       - status_busy.json                   - cycle in progress (uses stub driver)
       - status_dry_run.json                - dry-run mode advertised in /status
     """
-    from agilent_plateloc.api import create_app
-    from agilent_plateloc.service import _StubPlateLoc
+    from agilent_plateloc_server.api import create_app
+    from agilent_plateloc_server.service import _StubPlateLoc
 
     FIXTURES.mkdir(exist_ok=True)
 

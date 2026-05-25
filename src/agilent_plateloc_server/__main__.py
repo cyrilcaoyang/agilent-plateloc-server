@@ -2,7 +2,7 @@
 
 Run either of:
 
-    python -m agilent_plateloc           # uses config.toml [service] section
+    python -m agilent_plateloc_server           # uses config.toml [service] section
     agilent-plateloc-serve                # console_scripts wrapper
 
 Bind address and port are read from ``config.toml``::
@@ -52,7 +52,7 @@ def main() -> None:
     port = args.port or int(_config.get("service", "port", 8000))
     dry_run = True if args.dry_run else None  # None = "use config"
 
-    # uvicorn is imported lazily so `python -m agilent_plateloc --help` works
+    # uvicorn is imported lazily so `python -m agilent_plateloc_server --help` works
     # even when uvicorn isn't installed (e.g. driver-only install).
     import uvicorn
 
