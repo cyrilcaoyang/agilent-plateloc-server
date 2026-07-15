@@ -1007,6 +1007,46 @@ def test_last_error_code_low_air_pressure() -> None:
         c.__exit__(None, None, None)
 
 
+def test_last_error_code_no_plate() -> None:
+    """Seal on an empty stage: driver reports 'No Plate In Holder'.
+    Text match classifies it as no_plate (was com_other)."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="start_cycle",
+            exc=OSError("StartCycle returned error code -2147221503"),
+            driver_detail="No Plate In Holder",
+        )
+        r = c.post("/control/seal/start", json={"temperature_c": 170, "seconds": 3.0})
+        assert r.status_code == 500
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "no_plate"
+        assert "No Plate In Holder" in last_error["message"]
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_last_error_code_vacuum_error() -> None:
+    """Seal cycle fails at the vacuum step: driver reports 'Hot Plate
+    Vacuum Error'. Text match classifies it as vacuum_error."""
+    c, driver = _build_claimed_client(enforce_temp_interlock=True)
+    try:
+        _install_failure(
+            driver,
+            method="start_cycle",
+            exc=OSError("StartCycle returned error code -2147221503"),
+            driver_detail="Hot Plate Vacuum Error",
+        )
+        r = c.post("/control/seal/start", json={"temperature_c": 170, "seconds": 3.0})
+        assert r.status_code == 500
+        last_error = c.get("/status").json()["last_error"]
+        assert last_error["code"] == "vacuum_error"
+        assert "Hot Plate Vacuum Error" in last_error["message"]
+    finally:
+        c.__exit__(None, None, None)
+
+
 def test_last_error_code_com_init_failed() -> None:
     """startup() raises a generic transport-level error; the
     classifier falls back to com_init_failed (the startup context)."""

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.3.2 — classify `no_plate` and `vacuum_error`
+
+Two seal-cycle faults that previously fell through to `com_other` now
+get specific `last_error.code`s: `no_plate` ("No Plate In Holder") and
+`vacuum_error` ("Hot Plate Vacuum Error"). Both surfaced live on the
+bench; each is separately actionable (load a plate vs. check seal film
+/ vacuum), so the dashboard can render distinct recovery hints.
+Additive and back-compatible — the wire shape (`ErrorInfo.code` is
+`str | None`) is unchanged.
+
 ## v1.3.1 — structured `last_error.code` taxonomy
 
 `last_error.code` was a free-form string through v1.3.0 (typically

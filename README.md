@@ -538,6 +538,8 @@ rejects any value outside the table.
 | `code`              | When it fires                                                                                                 | Dashboard recovery hint                          |
 |---------------------|---------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
 | `low_air_pressure`  | Driver returns "Low Air Pressure" — the lab air supply dropped below the press requirement.                  | "Check air supply / regulator pressure."         |
+| `no_plate`          | Driver returns "No Plate In Holder" — a seal cycle started with an empty stage.                               | "Load a plate before sealing."                      |
+| `vacuum_error`      | Driver returns "Hot Plate Vacuum Error" — the cycle couldn't draw/hold vacuum (missing/failed seal film, plate mis-seated, or vacuum fault). | "Check seal film and plate seating; verify vacuum." |
 | `com_init_failed`   | Startup couldn't reach the physical sealer (e.g. powered off, serial cable disconnected, COM port busy).      | "Check power and serial cable; restart device."  |
 | `com_timeout`       | A COM call timed out without a specific driver error code.                                                    | "Driver unresponsive — restart device service."  |
 | `com_other`         | Catch-all for driver errors we don't yet classify. A repeated failure landing here is the cue to add a code. | "Unhandled driver fault — file a bug."           |
@@ -551,7 +553,8 @@ The classifier (`PlateLocService._classify_error`) inspects the
 failing method name, the exception, and the driver's
 `get_last_error()` detail string, in that order of specificity:
 Python type errors first (`process_internal`), then text-based driver
-matches (`low_air_pressure`, `heater_*`), then `com_timeout`, then
+matches (`low_air_pressure`, `no_plate`, `vacuum_error`, `heater_*`),
+then `com_timeout`, then
 context fallbacks (`stage_jam` for stage moves, `com_init_failed` for
 startup), then `com_other` as the default.
 

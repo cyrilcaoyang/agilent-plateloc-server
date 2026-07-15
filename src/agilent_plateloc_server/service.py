@@ -203,6 +203,8 @@ _RECENT_ERROR_WINDOW_S = 60.0  # how long an error keeps the device in `error`
 LAST_ERROR_CODES: frozenset[str] = frozenset(
     {
         "low_air_pressure",
+        "no_plate",
+        "vacuum_error",
         "com_init_failed",
         "com_timeout",
         "com_other",
@@ -226,8 +228,9 @@ def _classify_error(
        indicate a software bug, not a driver fault. Distinguishing
        these is the dashboard's signal to file a ticket rather than
        reach for the diagnostics dialog.
-    2. Specific text matches — ``low_air_pressure``, ``heater_*``,
-       ``profile_not_found``. Driver text is the most reliable signal.
+    2. Specific text matches — ``low_air_pressure``, ``no_plate``,
+       ``vacuum_error``, ``heater_*``, ``profile_not_found``. Driver text
+       is the most reliable signal.
     3. ``com_timeout`` — timeout substring beats generic com_other.
     4. Context fallbacks — ``stage_jam`` if the failing method was a
        stage move; ``com_init_failed`` if the failing method was
@@ -255,6 +258,12 @@ def _classify_error(
     # Driver-text matches — most specific signals.
     if "air pressure" in haystack:
         return "low_air_pressure"
+    # Seal-cycle physical faults. Distinct, actionable driver strings that
+    # otherwise fell through to com_other (observed live 2026-07-15).
+    if "no plate" in haystack:
+        return "no_plate"
+    if "vacuum" in haystack:
+        return "vacuum_error"
     if "overtemp" in haystack or "over temp" in haystack or "over-temperature" in haystack:
         return "heater_overtemp"
     if (
