@@ -41,5 +41,8 @@ agilent-plateloc-serve = "agilent_plateloc_server.__main__:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+agilent_plateloc_server = ["docs/*.md"]
+
 [tool.uv.sources]
 sdl-lab-contract = { git = "https://github.com/AccelerationConsortium/sdl-lab-contract", tag = "v1.2.0" }

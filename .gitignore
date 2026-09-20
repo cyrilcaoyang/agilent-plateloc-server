@@ -23,6 +23,8 @@ config.toml
 
 # Vendor docs (potentially copyrighted — keep local only)
 docs/
+# ...but the agent documentation under src/ is package data and must ship.
+!src/agilent_plateloc_server/docs/
 
 # OS
 Thumbs.db
